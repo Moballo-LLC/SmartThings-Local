@@ -60,6 +60,15 @@ UNREACHABLE_RECONNECT_S = 120.0
 # session.
 OBSERVE_REFRESH_INTERVAL_S = 6 * 3600.0
 
+# Base for the fixed DTLS source port; each appliance binds base+index so
+# every reconnect uses the same 5-tuple. If the bridge dies without
+# close_notify (crash, SIGKILL), the device holds an orphaned association
+# keyed to the old 5-tuple; re-handshaking from the SAME port makes the
+# device evict the orphan (RFC 6347 §4.2.8) instead of wedging on it —
+# the root cause behind stale sessions on always-on appliances, where the
+# orphan otherwise lingers 5-15 min.
+DTLS_LOCAL_PORT_BASE = 49700
+
 
 class PushBridge:
 
@@ -239,6 +248,7 @@ class PushBridge:
             cert_path=self.shared.CERT_PATH,
             key_path=self.shared.KEY_PATH,
             on_notification=self._on_notification,
+            local_port=DTLS_LOCAL_PORT_BASE + self.app.index,
         )
         sess.connect()
         self.session = sess

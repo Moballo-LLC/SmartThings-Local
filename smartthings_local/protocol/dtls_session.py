@@ -113,7 +113,8 @@ class DtlsCoapSession:
     def __init__(self, host, port, cert_path=None, key_path=None, *,
                  cert_pem=None, key_pem=None,
                  on_notification=None, mtu=1200,
-                 rate_limit_rps: float = _DEFAULT_RATE_LIMIT_RPS):
+                 rate_limit_rps: float = _DEFAULT_RATE_LIMIT_RPS,
+                 local_port=None):
         if (cert_path is not None or key_path is not None) and \
                 (cert_pem is not None or key_pem is not None):
             raise ValueError(
@@ -134,6 +135,17 @@ class DtlsCoapSession:
         self.on_notification = on_notification  # fn(href, payload_bytes)
         self.mtu = mtu
         self._min_req_interval = 1.0 / rate_limit_rps
+        # Optional fixed UDP source port. A client that dies without
+        # close_notify leaves an orphaned DTLS association on the device,
+        # keyed to the old 5-tuple; reconnecting from a fresh ephemeral
+        # port presents as a *new* peer and the orphan lingers until the
+        # device's own timer reaps it (observed 5-15 min on always-on
+        # appliances). Binding the same source port on every connect makes
+        # a restart re-handshake over the SAME 5-tuple, which RFC 6347
+        # §4.2.8 requires the server to treat as a rebooted peer: complete
+        # the new handshake and discard the old association. Verified
+        # accepted by RT-OCF (oven, 2026-07-26).
+        self.local_port = local_port
 
         self.sock = None
         self.conn = None
@@ -193,6 +205,12 @@ class DtlsCoapSession:
         conn.set_ciphertext_mtu(self.mtu)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        if self.local_port is not None:
+            # Fixed source port → same 5-tuple on reconnect, so the device
+            # evicts any orphaned association per RFC 6347 §4.2.8 instead
+            # of serving a second one alongside it. See __init__.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', self.local_port))
         sock.settimeout(2.0)
         dest = (self.host, self.port)
 
