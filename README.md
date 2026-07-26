@@ -88,12 +88,12 @@ Read the result:
 
 | Appliance class | Model family | Confirmed |
 |---|---|---|
-| Washer | WW11DG (`DA_WM_TP2_20_COMMON`) | All entities |
-| Dryer | DV90T, DV5000T (`DA_WM_TP2_20_COMMON`, `mnid=0AJT`) | All entities, ≤1s hot-tier poll (OBSERVE accelerates when online) |
+| Washer | WW11DG (`DA_WM_TP2_20_COMMON`) | All entities. Contributed by [@indykoning](https://github.com/indykoning) (PR #13); tested via [`mbillow/localthings`](https://github.com/mbillow/localthings) |
+| Dryer | DV5000T (`DA_WM_TP2_20_COMMON`, `mnid=0AJT`); DV90T reported same family | All entities, ≤1s hot-tier poll (OBSERVE accelerates when online) |
 | Oven | NV7000BS-class (`TP1X_DA-KS-OVEN-0107X`, `mnid=0AJT`) | All entities; hot-tier poll covers door + operational state regardless of cloud reachability |
 | Fridge | ARTIK051_REF_17K (`DA-REF-ART-COMMON-1_20201124`) | Contributed by [@aminorjourney](https://github.com/aminorjourney) (PR #1). Older firmware family; port 49155, minimal `/oic/res` with full tree under `/device/0` |
 
-Other appliances on the same firmware family (washers, dishwashers, AC units) almost certainly speak the same protocol — the auth path and read primitives are common. You'd write one new descriptor for the `localthings` registry.
+Other appliances on the same firmware family (dishwashers, AC units) almost certainly speak the same protocol — the auth path and read primitives are common, and a washer on the shared `DA_WM_TP2_20_COMMON` controller is already confirmed above. You'd write one new descriptor for the `localthings` registry.
 
 ### Firmware families — a limitation
 
