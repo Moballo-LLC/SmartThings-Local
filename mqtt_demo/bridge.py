@@ -24,6 +24,7 @@ import time
 import cbor2
 
 from smartthings_local.protocol.dtls_session import DtlsCoapSession, fmt_code
+from smartthings_local.protocol.dtls_probe import probe
 
 from smartthings_local.ocf.keepalive import KeepaliveTask
 from smartthings_local.ocf.observe_refresh import ObserveRefreshTask
@@ -69,6 +70,21 @@ OBSERVE_REFRESH_INTERVAL_S = 6 * 3600.0
 # orphan otherwise lingers 5-15 min.
 DTLS_LOCAL_PORT_BASE = 49700
 
+# SmartThings appliances bind their OCF CoAP-DTLS control port in this
+# dynamic band (dryer/fridge 49155, oven 49154). When OCF_PORT is unset we
+# race a stateless ClientHello across the band to find the live one instead
+# of trusting a single hardcoded default.
+OCF_PORT_BAND = range(49153, 49157)
+
+# The pre-flight liveness gate tolerates one dropped ClientHello (retries=1
+# → ~1 RTT when the device answers, ~2.6 s to call a silent port DEAD),
+# which is far cheaper than eating the 12 s HANDSHAKE_TIMEOUT_S on a
+# rebooting device or a wrong port. It is stateless (stops at
+# HelloVerifyRequest), so it leaves no association on the device and the
+# fixed-source-port reconnect invariant is untouched (see session_once).
+_GATE_RETRIES = 1
+_GATE_TIMEOUT_S = 4.0
+
 
 class PushBridge:
 
@@ -85,7 +101,11 @@ class PushBridge:
         self.log = bridge_logger(app.klass)
         self._serial: str | None = None
 
+        # Best-effort port for the startup log; the real port is resolved
+        # per-connect by _resolve_port (a pinned OCF_PORT is used as-is, an
+        # unset one is auto-discovered and cached in _discovered_port).
         self.port = app.ocf_port or descriptor.default_observe_port
+        self._discovered_port: int | None = None
 
         self.session: DtlsCoapSession | None = None
         self.scheduler: PollScheduler | None = None
@@ -242,15 +262,87 @@ class PushBridge:
 
     # ---- session lifecycle ------------------------------------------
 
+    def _candidate_ports(self) -> list[int]:
+        """The OCF band plus the descriptor's documented default, deduped
+        and ordered — the search space when OCF_PORT is unset."""
+        return sorted(set(OCF_PORT_BAND) | {self.descriptor.default_observe_port})
+
+    def _race_probe(self, candidates: list[int]) -> int | None:
+        """Race a stateless ClientHello across all candidates in parallel
+        and return the first port that answers LIVE — without waiting for
+        the dead ones to burn their full retry budget. Returns None if none
+        answer.
+
+        The winner comes back in ~1 RTT; the losing probes are abandoned
+        (shutdown(wait=False)) and each just runs out its own ~timeout loop
+        and closes its own socket in finally. This is a latency win, not a
+        correctness need — unlike #212's full-handshake race the losers are
+        bounded at a few seconds, not 12 s. Real appliances expose exactly
+        one DTLS port, so first-to-answer is unambiguous."""
+        import concurrent.futures as cf
+        ex = cf.ThreadPoolExecutor(max_workers=len(candidates))
+        try:
+            futs = [ex.submit(probe, self.app.ip, p,
+                              retries=_GATE_RETRIES, timeout=_GATE_TIMEOUT_S)
+                    for p in candidates]
+            for fut in cf.as_completed(futs):
+                r = fut.result()
+                if r.is_dtls_server:
+                    return r.port
+            return None
+        finally:
+            ex.shutdown(wait=False)
+
+    def _resolve_port(self) -> int:
+        """Return a port that just answered a stateless DTLS ClientHello,
+        or raise ConnectionError so run_forever backs off — instead of
+        committing a 12 s handshake against a silent/rebooting device or a
+        wrong port. The probe is stateless (RFC 6347 §4.2.1: the device
+        allocates nothing for a first ClientHello), so it leaves no
+        orphaned association to collide with the fixed-source-port
+        reconnect.
+
+        A pinned OCF_PORT is gated but never overridden. An unset port is
+        auto-discovered across the band and cached; the cache is tried
+        first on the next reconnect and rediscovered only if it goes DEAD."""
+        pinned = self.app.ocf_port
+        if pinned is not None:
+            r = probe(self.app.ip, pinned,
+                      retries=_GATE_RETRIES, timeout=_GATE_TIMEOUT_S)
+            if not r.is_dtls_server:
+                raise ConnectionError(
+                    f"port {pinned} not a live DTLS server ({r.outcome})")
+            return pinned
+
+        # A previously discovered port is almost certainly still the one —
+        # try it alone first and only fall back to a full band re-race if
+        # it has gone silent (firmware moved it, or it was never right).
+        if self._discovered_port is not None:
+            r = probe(self.app.ip, self._discovered_port,
+                      retries=_GATE_RETRIES, timeout=_GATE_TIMEOUT_S)
+            if r.is_dtls_server:
+                return self._discovered_port
+            self._discovered_port = None
+
+        candidates = self._candidate_ports()
+        live = self._race_probe(candidates)
+        if live is None:
+            raise ConnectionError(f"no live DTLS server across {candidates}")
+        self.log.info("discovered DTLS port %d", live)
+        self._discovered_port = live
+        return live
+
     def session_once(self):
+        port = self._resolve_port()
         sess = DtlsCoapSession(
-            self.app.ip, self.port,
+            self.app.ip, port,
             cert_path=self.shared.CERT_PATH,
             key_path=self.shared.KEY_PATH,
             on_notification=self._on_notification,
             local_port=DTLS_LOCAL_PORT_BASE + self.app.index,
         )
         sess.connect()
+        self.port = port
         self.session = sess
         self.session_started_ts = time.time()
         self.connect_count += 1

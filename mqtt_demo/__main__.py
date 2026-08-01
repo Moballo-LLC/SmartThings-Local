@@ -63,9 +63,12 @@ def main():
                 shared.MQTT_BROKER, shared.MQTT_PORT,
                 shared.MQTT_USER or '<anon>')
     for app, desc in pairs:
-        port = app.ocf_port or desc.default_observe_port
-        logger.info("  [%d] %s @ %s:%d (DTLS) → topic %s/*",
-                    app.index, app.klass, app.ip, port, app.topic_prefix)
+        if app.ocf_port is not None:
+            port_note = f"{app.ocf_port} (DTLS)"
+        else:
+            port_note = f"{desc.default_observe_port}? (DTLS, auto-discover)"
+        logger.info("  [%d] %s @ %s:%s → topic %s/*",
+                    app.index, app.klass, app.ip, port_note, app.topic_prefix)
 
     # --- MQTT client (shared) ---
     cli = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
