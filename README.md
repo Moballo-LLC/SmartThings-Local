@@ -64,7 +64,7 @@ For a full worked integration, the higher-level `smartthings_local.ocf` layer �
 
 ### Under the hood
 
-Each appliance runs an independent bridge built around three coordinated pieces over one persistent DTLS session: a `StateCache` (single source of truth for all reps), a `PollScheduler` (tiered adaptive polling — hot/warm/cold + a periodic `/device/0` sweep), and a `KeepaliveTask` (CoAP empty-CON ping for DTLS-layer liveness, with consecutive-failure detection for MQTT availability). Tier cadences are descriptor-declared and were calibrated against the empirically-measured per-firmware ceilings: dryer ~14 req/s, oven ~8 req/s. OBSERVE registrations (RFC 7641) are kept as an opportunistic freshness accelerator — when the appliance has internet and emits notifications, the cache absorbs them and the next-poll timer is reset for that resource; when it's air-gapped, polling alone carries the UX with no other code change. Token-stable Block2 (RFC 7959) handles multi-block reads. Writes are optimistically merged into the cache the moment the device 2.04-confirms, with the scheduler deferring that resource's next poll past the fetchback-revert window. Reconnect with exponential backoff on session errors.
+Each appliance runs an independent bridge built around three coordinated pieces over one persistent DTLS session: a `StateCache` (single source of truth for all reps), a `PollScheduler` (tiered adaptive polling — hot/warm/cold + a periodic `/device/0` sweep), and a `KeepaliveTask` (CoAP empty-CON ping for DTLS-layer liveness, with consecutive-failure detection for MQTT availability). Tier cadences are descriptor-declared and were calibrated against the empirically-measured per-firmware ceilings: dryer ~14 req/s, oven ~8 req/s. OBSERVE registrations (RFC 7641) are kept as an opportunistic freshness accelerator — when the appliance has internet and emits notifications, the cache absorbs them and the next-poll timer is reset for that resource; when it's air-gapped, polling alone carries the UX with no other code change. Token-stable Block2 (RFC 7959) handles multi-block reads. Writes are optimistically merged into the cache the moment the device 2.04-confirms, with the scheduler deferring that resource's next poll past the fetchback-revert window. Reconnect with exponential backoff on session errors, gated by a stateless DTLS ClientHello pre-flight (`smartthings_local/protocol/dtls_probe.py`) so a silent/rebooting device or wrong port drops into backoff in ~1 RTT instead of eating the full handshake timeout; when `OCF_PORT` is unset the same probe auto-discovers the live port across the OCF band.
 
 Authentication uses a client cert keyed to the UUID published in Samsung's own wildcard cloud TLS cert. Every Samsung Tizen/RT-OCF appliance's factory ACL grants that UUID `perm=31` (full CRUDN) on `href=*`, so a single cert chain works across the whole fleet. Setup is one Python script.
 
@@ -84,12 +84,21 @@ Read the result:
 - **`49154/udp` (or similar 4915x) open|filtered with a DTLS handshake responding** → newer firmware (Tizen RT 3.x with DAWIT 3.0). This is what the bridge talks to.
 - **Only `8888/tcp` open (token-based HTTPS)** → older firmware (~2018–2022). **Not supported here.**
 
+nmap's `open|filtered` can't tell a real DTLS server from a silent UDP port. Confirm which of the candidate ports actually speaks DTLS with the ClientHello probe — it sends one ClientHello and reports back per port:
+
+```sh
+# Stateless liveness check — one ClientHello round trip; leaves no state on the device
+.venv/bin/python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 49153 49154 49155 49156 --stateless
+```
+
+`live` means a DTLS server answered its `HelloVerifyRequest` (that's your control port); `dead` means silent / not DTLS. Once you have the client cert (Part 2), drop `--stateless` to run the default *diagnostic* drive, which reports `completed` (cert accepted) or `rejected` with the server's fatal alert — an `unsupported_certificate` / `unknown_ca` alert is the signature of a newer OCF-PKI device that won't accept the AC14K_M cert. The same probe gates the bridge's own reconnect loop and auto-discovers the port when `OCF_PORT` is unset.
+
 ### Tested combinations
 
 | Appliance class | Model family | Confirmed |
 |---|---|---|
-| Washer | WW11DG (`DA_WM_TP2_20_COMMON`) | All entities. Contributed by [@indykoning](https://github.com/indykoning) (PR #13); tested via [`mbillow/localthings`](https://github.com/mbillow/localthings) |
-| Dryer | DV5000T (`DA_WM_TP2_20_COMMON`, `mnid=0AJT`); DV90T reported same family | All entities, ≤1s hot-tier poll (OBSERVE accelerates when online) |
+| Washer | WW11DG (`DA_WM_TP2_20_COMMON`, `mnid=0AJT`) | All entities. Contributed by [@indykoning](https://github.com/indykoning) (PR #13); tested via [`mbillow/localthings`](https://github.com/mbillow/localthings) |
+| Dryer | DV5000T (`DA_WM_TP2_20_COMMON`, `mnid=0AJT`); DV90T (same `mnid=0AJT`) | All entities, ≤1s hot-tier poll (OBSERVE accelerates when online) |
 | Oven | NV7000BS-class (`TP1X_DA-KS-OVEN-0107X`, `mnid=0AJT`) | All entities; hot-tier poll covers door + operational state regardless of cloud reachability |
 | Fridge | ARTIK051_REF_17K (`DA-REF-ART-COMMON-1_20201124`) | Contributed by [@aminorjourney](https://github.com/aminorjourney) (PR #1). Older firmware family; port 49155, minimal `/oic/res` with full tree under `/device/0` |
 
@@ -101,7 +110,7 @@ Descriptors are firmware-family-specific. Each descriptor hardcodes the resource
 
 **What this means in practice:** if you set `APPLIANCE_<n>_CLASS=fridge` on a fridge that speaks a different firmware family than the one this descriptor was built for, the bridge will start and connect fine, but many sensors will publish as unknown and some controls won't work. Nothing catastrophic — you just get a half-broken HA device card.
 
-If your appliance model doesn't match a row in the tested table above, it may still work if it's on the same firmware family; otherwise you'd write a new descriptor (see "Adding a new appliance class" below). The ARTIK051 fridge and the newer RF9000B-class fridge, for example, expose genuinely different resource models (collection-resource vs per-instance-resource) and can't share a descriptor even though they're both "fridges".
+If your appliance model doesn't match a row in the tested table above, it may still work if it's on the same firmware family; otherwise you'd write a new descriptor (see "Adding a new appliance class" below). The ARTIK051 fridge and the newer RF9000B-class fridge, for example, expose different resource models (collection-resource vs per-instance-resource) and can't share a descriptor even though they're both "fridges".
 
 ---
 
@@ -189,14 +198,14 @@ APPLIANCE_COUNT=2
 # Appliance 1 — dryer
 APPLIANCE_1_CLASS=dryer
 APPLIANCE_1_IP=192.168.1.100
-APPLIANCE_1_OCF_PORT=             # blank → descriptor default (49155 for dryer)
+APPLIANCE_1_OCF_PORT=             # blank → auto-discover across the OCF band (dryer=49155)
 APPLIANCE_1_TOPIC=samsung_dryer
 APPLIANCE_1_NAME=Samsung Dryer
 
 # Appliance 2 — oven
 APPLIANCE_2_CLASS=oven
 APPLIANCE_2_IP=192.168.1.101
-APPLIANCE_2_OCF_PORT=             # blank → descriptor default (49154 for oven)
+APPLIANCE_2_OCF_PORT=             # blank → auto-discover across the OCF band (oven=49154)
 APPLIANCE_2_TOPIC=samsung_oven
 APPLIANCE_2_NAME=Samsung Oven
 ```
@@ -242,9 +251,11 @@ python3 -m venv .venv
 ```
 14:08:42  INFO   mqtt_demo                SmartThings-Local Bridge starting (2 appliances)
 14:08:42  INFO   mqtt_demo                  broker = <broker-ip>:1883 (user=<mqtt-user>)
-14:08:42  INFO   mqtt_demo                  [1] dryer @ <dryer-ip>:49155 (DTLS) → topic samsung_dryer/*
-14:08:42  INFO   mqtt_demo                  [2] oven  @ <oven-ip>:49154 (DTLS) → topic samsung_oven/*
+14:08:42  INFO   mqtt_demo                  [1] dryer @ <dryer-ip>:49155? (DTLS, auto-discover) → topic samsung_dryer/*
+14:08:42  INFO   mqtt_demo                  [2] oven  @ <oven-ip>:49154? (DTLS, auto-discover) → topic samsung_oven/*
 14:08:42  INFO   mqtt_demo                MQTT connected → <broker-ip>:1883
+14:08:43  INFO   dryer                    discovered DTLS port 49155
+14:08:43  INFO   oven                     discovered DTLS port 49154
 14:08:43  INFO   dryer                    DTLS connected — subscribing 11 paths
 14:08:44  INFO   dryer.<dryer-serial>     identified — serial=…
 14:08:44  INFO   dryer.<dryer-serial>     seeded → 25 links; sensors live
@@ -321,7 +332,7 @@ Notes specific to this firmware family:
 | `APPLIANCE_COUNT` | Number of `APPLIANCE_<n>_*` blocks to read (1-indexed) |
 | `APPLIANCE_<n>_CLASS` | Descriptor name: `dryer`, `oven`, `fridge` |
 | `APPLIANCE_<n>_IP` | LAN IP of the appliance |
-| `APPLIANCE_<n>_OCF_PORT` | Optional override (blank → descriptor default: dryer=49155, oven=49154, fridge=49155) |
+| `APPLIANCE_<n>_OCF_PORT` | Optional. Blank → auto-discover the DTLS port across the OCF band 49153–49156 (via a stateless ClientHello probe); set it to pin a specific port and skip discovery (dryer=49155, oven=49154, fridge=49155) |
 | `APPLIANCE_<n>_TOPIC` | MQTT topic prefix (also the HA device identifier — changing it re-keys the device) |
 | `APPLIANCE_<n>_NAME` | Friendly name on the HA device card |
 | `MQTT_BROKER` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` | Broker config |
