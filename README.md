@@ -88,7 +88,7 @@ nmap's `open|filtered` can't tell a real DTLS server from a silent UDP port. Con
 
 ```sh
 # Stateless liveness check: one ClientHello round trip, leaves no state on the device
-.venv/bin/python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 49153 49154 49155 49156 --stateless
+python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 49153 49154 49155 49156 --stateless
 ```
 
 `live` means a DTLS server answered its `HelloVerifyRequest` (that's your control port); `dead` means silent / not DTLS. Once you have the client cert (Part 2), drop `--stateless` to run the default *diagnostic* drive, which reports `completed` (cert accepted) or `rejected` with the server's fatal alert. An `unsupported_certificate` / `unknown_ca` alert is the signature of a newer OCF-PKI device that won't accept the AC14K_M cert. The same probe gates the bridge's own reconnect loop and auto-discovers the port when `OCF_PORT` is unset.
@@ -170,6 +170,8 @@ What it does:
 Output in `./certs/`: `client_fullchain.pem` + `client.key`.
 
 Neither the UUID nor the AC14K_M bundle is hardcoded in this repo; both are fetched live each run, so the script self-updates if upstream rotates. If either fetch fails, the script prints an inline workaround: supply the UUID via `UUID=<uuid>` env, or supply the AC14K_M bundle via `AC14K_M_CERT_BUNDLE=/path/to/cert.pem`. `BRAYSTORM_URL=<mirror>` points at a different bundle source.
+
+On Fedora/RHEL (and other hardened OpenSSL 3.x builds) the default crypto policy blocks SHA-1 signing, which step 5 needs. The script detects this, retries the signing step once with SHA-1 force-enabled for just that command, and only fails if the retry also fails. If it does, it prints the remedy: `sudo update-crypto-policies --set DEFAULT:SHA1` (undo afterward with `sudo update-crypto-policies --set DEFAULT`).
 
 ### How durable is this?
 
@@ -400,6 +402,7 @@ smartthings_local/                   The installable library — `pip install sm
     __init__.py
     coap.py                          CoAP wire protocol: message encode/decode, token handling
     dtls_session.py                  DTLS session: handshake, client-cert auth (file or in-memory PEM), Block2, liveness
+    dtls_probe.py                    DTLS ClientHello liveness probe (stateless gate + diagnostic mode)
     ocf_root_ca.pem                  Samsung OCF root CA, bundled for handshake verification
   ocf/                               OCF resource + state layer (reusable)
     __init__.py
@@ -426,7 +429,7 @@ mqtt_demo/                           MQTT bridge demo (consumes smartthings_loca
   .env.example                       Template — copy to .env, fill in
 setup_cert.py                        One-shot cert minting script (live-fetches AC14K_M + UUID)
 pyproject.toml                       Packaging — PyPI dist `smartthings-local`, hatch-vcs versioning
-tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading)
+tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading, DTLS probe, bridge port resolution, cert signing)
 .github/workflows/publish.yml        Build + PyPI Trusted Publishing on `v*` tags
 ```
 
