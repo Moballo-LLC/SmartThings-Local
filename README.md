@@ -48,6 +48,37 @@ If the cert/key are minted at runtime and never written to disk (e.g. inside an 
 sess = DtlsCoapSession("192.168.1.100", 49154, cert_pem=cert_pem, key_pem=key_pem)
 ```
 
+### Classified errors
+
+Runtime transport failures use the public types in
+
+```python
+from smartthings_local.errors import SessionClosedError, SmartThingsLocalError
+```
+
+All classified errors inherit from `SmartThingsLocalError` and expose a stable
+`code`. Their messages are fixed and deliberately omit remote endpoints, local
+paths, credential metadata, raw packets, and backend exception text. Existing
+callers can keep catching the built-in types used by earlier releases:
+
+| Error | Stable code | Compatible built-in |
+| --- | --- | --- |
+| `EndpointError` | `endpoint` | `OSError` |
+| `ProbeError` | `probe` | `ConnectionError` |
+| `SessionError` | `session` | `ConnectionError` |
+| `AuthenticationError` | `authentication` | `ConnectionError` |
+| `AuthorizationError` | `authorization` | `PermissionError` |
+| `SessionTimeoutError` | `timeout` | `TimeoutError` |
+| `SessionClosedError` | `session_closed` | `ConnectionError` |
+| `MalformedMessageError` | `malformed_message` | `ValueError` |
+| `BlockwiseError` | `blockwise` | `ConnectionError` |
+| `ObserveError` | `observe` | `ConnectionError` |
+
+Constructor argument validation remains a normal `ValueError`. When a backend
+failure is chained for debugging, the cause is replaced with a fixed redacted
+marker; raw backend text is not copied into the public error or its formatted
+traceback.
+
 For a full worked integration, the higher-level `smartthings_local.ocf` layer (`StateCache`, `PollScheduler`, `KeepaliveTask`, `ObserveRefreshTask`) coordinates tiered polling and OBSERVE on top of a session. The MQTT bridge demo below wires all of it together.
 
 ### What the demo bridge gives you
