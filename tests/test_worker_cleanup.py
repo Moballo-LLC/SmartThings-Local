@@ -23,21 +23,29 @@ class _Descriptor:
         return None
 
 
+class _ObservedEvent(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait(self, timeout=None):
+        self.waiting.set()
+        return super().wait(timeout)
+
+
 def _assert_worker_stops(target, name: str):
-    stop = threading.Event()
-    entered = threading.Event()
+    stop = _ObservedEvent()
     errors: list[str] = []
 
     def run():
-        entered.set()
         try:
             target(stop)
         except Exception as error:  # noqa: BLE001  # pragma: no cover
             errors.append(type(error).__name__)
 
-    worker = threading.Thread(target=run, name=name)
+    worker = threading.Thread(target=run, name=name, daemon=True)
     worker.start()
-    assert entered.wait(0.5), f"{name} did not enter its worker"
+    assert stop.waiting.wait(0.5), f"{name} did not enter an interruptible wait"
     stop.set()
     worker.join(0.5)
     assert not worker.is_alive(), f"{name} did not stop"
