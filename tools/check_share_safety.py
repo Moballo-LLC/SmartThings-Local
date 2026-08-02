@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check changed public files for common private-data and secret shapes.
+"""Check introduced public content for common private-data and secret shapes.
 
 Findings contain only path, line, and rule ID. Matched content is never
 printed because it may itself be sensitive.
@@ -92,11 +92,14 @@ PATTERNS = (
         re.compile(r"(?i)\b(?:qr[_-]?payload|setup[_-]?payload)\b\s*(?::|=)"),
     ),
 )
-UUID_RE = re.compile(
-    r"(?i)(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![0-9a-f])"
+UUID_PATTERN = r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?![0-9a-f])"
+UUID_RE = re.compile(UUID_PATTERN, re.IGNORECASE)
+PUBLIC_GITHUB_ATTACHMENT_RE = re.compile(
+    rf"https://github\.com/user-attachments/assets/(?P<uuid>{UUID_PATTERN})",
+    re.IGNORECASE,
 )
 IPV4_RE = re.compile(
-    r"(?<![0-9])(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}(?![0-9])"
+    r"(?<![0-9.])(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}(?![0-9.])"
 )
 IPV6_RE = re.compile(
     r"(?i)(?<![0-9a-f:])(?:\[)?(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?:%[A-Za-z0-9_.-]+)?(?:\])?(?![0-9a-f:])"
@@ -132,11 +135,16 @@ def _safe_ipv6(value: str) -> bool:
 def scan_text(path: str, text: str) -> list[Finding]:
     findings: set[Finding] = set()
     for line_number, line in enumerate(text.splitlines(), start=1):
+        public_attachment_uuids = {
+            match.group("uuid").lower()
+            for match in PUBLIC_GITHUB_ATTACHMENT_RE.finditer(line)
+        }
         for rule_id, pattern in PATTERNS:
             if pattern.search(line):
                 findings.add(Finding(path, line_number, rule_id))
         for match in UUID_RE.finditer(line):
-            if match.group(0).lower() not in SAFE_UUIDS:
+            value = match.group(0).lower()
+            if value not in SAFE_UUIDS and value not in public_attachment_uuids:
                 findings.add(Finding(path, line_number, "UUID"))
         for match in IPV4_RE.finditer(line):
             if not _safe_ipv4(match.group(0)):
@@ -200,6 +208,73 @@ def _changed_paths(base: str) -> list[str]:
     )
 
 
+def _local_changed_paths() -> set[str]:
+    commands = (
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z", "--"],
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", "--"],
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    outputs = (
+        subprocess.run(command, capture_output=True, check=True).stdout
+        for command in commands
+    )
+    return {
+        value.decode("utf-8")
+        for output in outputs
+        for value in output.split(b"\0")
+        if value
+    }
+
+
+HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@")
+
+
+def _introduced_lines(base: str, path: str) -> set[int]:
+    result = subprocess.run(
+        [
+            "git",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--unified=0",
+            "--diff-filter=ACMR",
+            f"{base}..HEAD",
+            "--",
+            path,
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    lines: set[int] = set()
+    for value in result.stdout.splitlines():
+        match = HUNK_RE.match(value)
+        if match is None:
+            continue
+        start = int(match.group("start"))
+        count = int(match.group("count") or 1)
+        lines.update(range(start, start + count))
+    return lines
+
+
+def check_changed(base: str) -> list[Finding]:
+    """Scan introduced committed lines and all local-only file content."""
+    local_paths = _local_changed_paths()
+    findings: list[Finding] = []
+    for path in _changed_paths(base):
+        path_findings = scan_file(Path(path), path)
+        if path in local_paths:
+            findings.extend(path_findings)
+            continue
+        introduced = _introduced_lines(base, path)
+        findings.extend(
+            finding
+            for finding in path_findings
+            if finding.line == 0 or finding.line in introduced
+        )
+    return sorted(set(findings))
+
+
 def check_paths(paths: Iterable[str]) -> list[Finding]:
     findings: list[Finding] = []
     for value in paths:
@@ -216,7 +291,11 @@ def main() -> int:
         paths = _changed_paths(args.changed_since) if args.changed_since else args.paths
         if not paths:
             raise ValueError("no paths selected")
-        findings = check_paths(paths)
+        findings = (
+            check_changed(args.changed_since)
+            if args.changed_since
+            else check_paths(paths)
+        )
     except (OSError, UnicodeDecodeError, subprocess.SubprocessError, ValueError):
         print("share-safety scan failed closed:SCAN_ERROR")
         return 2

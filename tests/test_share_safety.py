@@ -13,6 +13,22 @@ def test_documentation_addresses_and_synthetic_uuid_are_safe():
     assert check_share_safety.scan_text("fixture.txt", text) == []
 
 
+def test_dotted_object_identifiers_are_not_ipv4_addresses():
+    text = "extendedKeyUsage = 1.3.6.1.4.1.51414.0.1.2"
+
+    assert check_share_safety.scan_text("fixture.txt", text) == []
+
+
+def test_public_github_attachment_uuid_is_safe_but_bare_uuid_is_not():
+    value = "cc1dca15-f272-4625-" + "a13c-2dc82283ff95"
+    public_url = f"https://github.com/user-attachments/assets/{value}"
+
+    assert check_share_safety.scan_text("README.md", public_url) == []
+    assert check_share_safety.scan_text("fixture.txt", value) == [
+        check_share_safety.Finding("fixture.txt", 1, "UUID")
+    ]
+
+
 def test_findings_never_echo_matched_content():
     cases = {
         "PEM_PRIVATE_KEY": "-----BEGIN " + "PRIVATE KEY-----",
@@ -93,4 +109,50 @@ def test_changed_paths_include_staged_unstaged_and_untracked_files(
         "baseline.txt",
         "staged.txt",
         "untracked.txt",
+    ]
+
+
+def test_committed_scan_ignores_unchanged_findings_but_checks_added_lines(
+    tmp_path, monkeypatch
+):
+    def git(*args):
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=" + "test" + chr(64) + "example.invalid",
+                *args,
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+
+    candidate = tmp_path / "candidate.txt"
+    private_one = "10." + "24.8.9"
+    private_two = "10." + "24.8.10"
+    git("init", "--quiet")
+    candidate.write_text(f"existing {private_one}\n")
+    git("add", "candidate.txt")
+    git("commit", "--quiet", "-m", "baseline")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    candidate.write_text(f"existing {private_one}\nsafe addition\n")
+    git("add", "candidate.txt")
+    git("commit", "--quiet", "-m", "safe change")
+    monkeypatch.chdir(tmp_path)
+    assert check_share_safety.check_changed(base) == []
+
+    candidate.write_text(
+        f"existing {private_one}\nsafe addition\nintroduced {private_two}\n"
+    )
+    git("add", "candidate.txt")
+    git("commit", "--quiet", "-m", "unsafe change")
+    assert check_share_safety.check_changed(base) == [
+        check_share_safety.Finding("candidate.txt", 3, "NON_DOCUMENTATION_IPV4")
     ]

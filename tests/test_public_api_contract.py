@@ -9,23 +9,37 @@ from smartthings_local.ocf.state_cache import StateCache
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 
-def _parameter_names(callable_object) -> list[str]:
-    return list(inspect.signature(callable_object).parameters)
+def _assert_compatible_signature(callable_object, expected: list[str]) -> None:
+    """Require the existing call surface while allowing safe extensions."""
+    parameters = list(inspect.signature(callable_object).parameters.values())
+    assert [parameter.name for parameter in parameters[: len(expected)]] == expected
+    for parameter in parameters[len(expected) :]:
+        assert (
+            parameter.kind
+            in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            )
+            or parameter.default is not inspect.Parameter.empty
+        )
 
 
 def test_dtls_session_constructor_keeps_file_memory_and_local_port_inputs():
-    assert _parameter_names(DtlsCoapSession) == [
-        "host",
-        "port",
-        "cert_path",
-        "key_path",
-        "cert_pem",
-        "key_pem",
-        "on_notification",
-        "mtu",
-        "rate_limit_rps",
-        "local_port",
-    ]
+    _assert_compatible_signature(
+        DtlsCoapSession,
+        [
+            "host",
+            "port",
+            "cert_path",
+            "key_path",
+            "cert_pem",
+            "key_pem",
+            "on_notification",
+            "mtu",
+            "rate_limit_rps",
+            "local_port",
+        ],
+    )
 
 
 def test_dtls_session_keeps_current_consumer_methods():
@@ -42,23 +56,32 @@ def test_dtls_session_keeps_current_consumer_methods():
         "subscribe",
     }
     assert expected <= set(dir(DtlsCoapSession))
-    assert _parameter_names(DtlsCoapSession.get) == [
-        "self",
-        "path_segs",
-        "query",
-        "timeout",
-    ]
-    assert _parameter_names(DtlsCoapSession.post) == [
-        "self",
-        "path_segs",
-        "body_cbor",
-        "timeout",
-    ]
-    assert _parameter_names(DtlsCoapSession.subscribe) == ["self", "path_segs"]
+    _assert_compatible_signature(
+        DtlsCoapSession.get,
+        [
+            "self",
+            "path_segs",
+            "query",
+            "timeout",
+        ],
+    )
+    _assert_compatible_signature(
+        DtlsCoapSession.post,
+        [
+            "self",
+            "path_segs",
+            "body_cbor",
+            "timeout",
+        ],
+    )
+    _assert_compatible_signature(
+        DtlsCoapSession.subscribe,
+        ["self", "path_segs"],
+    )
 
 
 def test_state_cache_keeps_current_consumer_surface():
-    assert _parameter_names(StateCache) == ["descriptor"]
+    _assert_compatible_signature(StateCache, ["descriptor"])
     expected = {
         "apply_optimistic",
         "apply_rep",
@@ -73,10 +96,16 @@ def test_state_cache_keeps_current_consumer_surface():
 
 
 def test_observe_refresh_task_keeps_current_consumer_surface():
-    assert _parameter_names(ObserveRefreshTask) == [
-        "session",
-        "paths",
-        "interval_s",
-        "logger",
-    ]
-    assert _parameter_names(ObserveRefreshTask.run_forever) == ["self", "stop"]
+    _assert_compatible_signature(
+        ObserveRefreshTask,
+        [
+            "session",
+            "paths",
+            "interval_s",
+            "logger",
+        ],
+    )
+    _assert_compatible_signature(
+        ObserveRefreshTask.run_forever,
+        ["self", "stop"],
+    )

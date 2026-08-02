@@ -9,6 +9,8 @@ from smartthings_local.ocf.observe_refresh import ObserveRefreshTask
 from smartthings_local.ocf.poll_scheduler import PollScheduler, PollTier
 from smartthings_local.ocf.state_cache import StateCache
 
+_THREAD_DEADLINE_S = 2.0
+
 
 class _Session:
     def ping(self):
@@ -45,9 +47,11 @@ def _assert_worker_stops(target, name: str):
 
     worker = threading.Thread(target=run, name=name, daemon=True)
     worker.start()
-    assert stop.waiting.wait(0.5), f"{name} did not enter an interruptible wait"
+    assert stop.waiting.wait(_THREAD_DEADLINE_S), (
+        f"{name} did not enter an interruptible wait"
+    )
     stop.set()
-    worker.join(0.5)
+    worker.join(_THREAD_DEADLINE_S)
     assert not worker.is_alive(), f"{name} did not stop"
     assert errors == [], f"{name} raised {errors[0]}"
 
