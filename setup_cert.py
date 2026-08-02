@@ -216,6 +216,17 @@ def run(cmd, **kw):
 def run_allow_sha1(cmd):
     """Run an openssl command with SHA-1 signatures force-enabled, for
     distros whose crypto policy otherwise blocks SHA-1 signing."""
+    version = run(['openssl', 'version']).stdout.strip()
+    if not version.startswith('OpenSSL 3.'):
+        # The provider configuration below is specific to OpenSSL 3.
+        # LibreSSL can exit successfully without running the requested
+        # command when it is given that configuration, leaving no output
+        # certificate behind. Older OpenSSL releases do not need the
+        # provider override either, so retry them with a clean environment.
+        env = dict(os.environ)
+        env.pop('OPENSSL_CONF', None)
+        return run(cmd, env=env)
+
     conf = tempfile.NamedTemporaryFile(
         'w', suffix='.cnf', prefix='sha1_ok_', delete=False)
     conf.write(SHA1_OVERRIDE_CONF)

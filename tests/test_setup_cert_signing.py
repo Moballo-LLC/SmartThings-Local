@@ -77,6 +77,24 @@ def test_mint_cert_retries_when_sha1_signing_blocked(tmp_path, monkeypatch):
     assert paths["leaf"].exists()        # the override retry recovered
 
 
+def test_sha1_retry_does_not_give_openssl_3_config_to_libressl(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        if cmd == ["openssl", "version"]:
+            return subprocess.CompletedProcess(cmd, 0, "LibreSSL 3.3.6\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(setup_cert, "run", fake_run)
+    monkeypatch.setenv("OPENSSL_CONF", "/synthetic/inherited.cnf")
+
+    setup_cert.run_allow_sha1(["openssl", "x509", "-req"])
+
+    assert calls[1][0] == ["openssl", "x509", "-req"]
+    assert "OPENSSL_CONF" not in calls[1][1]["env"]
+
+
 def test_command_error_includes_stderr():
     with pytest.raises(setup_cert.CommandError) as exc:
         setup_cert.run(["openssl", "x509", "-in", "/no/such/file"])
