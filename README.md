@@ -79,6 +79,36 @@ failure is chained for debugging, the cause is replaced with a fixed redacted
 marker; raw backend text is not copied into the public error or its formatted
 traceback.
 
+### Resolved UDP endpoints
+
+Sessions resolve a host to a first-class `ResolvedUdpEndpoint` and use a
+connected UDP socket for the DTLS transport. Connecting the datagram socket
+pins it to the exact resolved peer, so unrelated datagrams from another host
+using the same port are discarded by the operating system. IPv4, IPv6, and
+scoped IPv6 tuples are preserved without putting the address or scope in the
+endpoint's `repr`.
+
+Address family and fixed source-port behavior are explicit and optional:
+
+```python
+import socket
+
+sess = DtlsCoapSession(
+    "device.example",
+    49154,
+    cert_pem=cert_pem,
+    key_pem=key_pem,
+    family=socket.AF_INET6,
+    local_port=56830,
+)
+sess.connect()
+assert sess.endpoint.family == socket.AF_INET6
+```
+
+The resolver retains candidate order and the socket setup tries the next
+candidate after a family, bind, or connect failure. Resolution and socket
+setup failures raise the redacted `EndpointError` documented above.
+
 For a full worked integration, the higher-level `smartthings_local.ocf` layer (`StateCache`, `PollScheduler`, `KeepaliveTask`, `ObserveRefreshTask`) coordinates tiered polling and OBSERVE on top of a session. The MQTT bridge demo below wires all of it together.
 
 ### What the demo bridge gives you

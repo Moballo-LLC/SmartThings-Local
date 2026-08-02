@@ -29,6 +29,7 @@ from OpenSSL import SSL
 
 from ..errors import (
     BlockwiseError,
+    EndpointError,
     SessionClosedError,
     SessionError,
     SessionTimeoutError,
@@ -41,6 +42,7 @@ from .coap import (
     encode_options, parse_coap, build_coap, block_value, fmt_code,
     split_dtls as _split_dtls,
 )
+from .endpoint import open_connected_udp_socket
 import logging
 
 logger = logging.getLogger(__name__)
@@ -120,7 +122,7 @@ class DtlsCoapSession:
                  cert_pem=None, key_pem=None,
                  on_notification=None, mtu=1200,
                  rate_limit_rps: float = _DEFAULT_RATE_LIMIT_RPS,
-                 local_port=None):
+                 local_port=None, family=socket.AF_UNSPEC):
         if (cert_path is not None or key_path is not None) and \
                 (cert_pem is not None or key_pem is not None):
             raise ValueError(
@@ -152,10 +154,12 @@ class DtlsCoapSession:
         # the new handshake and discard the old association. Verified
         # accepted by RT-OCF (oven, 2026-07-26).
         self.local_port = local_port
+        self.family = family
 
         self.sock = None
         self.conn = None
         self.dest = None
+        self.endpoint = None
 
         self._send_lock = threading.Lock()
         # Randomize MID and token counter starting points so reconnects
@@ -210,15 +214,14 @@ class DtlsCoapSession:
         conn.set_connect_state()
         conn.set_ciphertext_mtu(self.mtu)
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if self.local_port is not None:
-            # Fixed source port → same 5-tuple on reconnect, so the device
-            # evicts any orphaned association per RFC 6347 §4.2.8 instead
-            # of serving a second one alongside it. See __init__.
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('', self.local_port))
-        sock.settimeout(2.0)
-        dest = (self.host, self.port)
+        sock, endpoint = open_connected_udp_socket(
+            self.host,
+            self.port,
+            family=self.family,
+            local_port=self.local_port,
+            timeout=2.0,
+        )
+        dest = endpoint.sockaddr
 
         t0 = time.time()
         backend_failed = False
@@ -232,19 +235,32 @@ class DtlsCoapSession:
                 sock.close()
                 backend_failed = True
                 break
+            send_failed = False
             try:
                 o = conn.bio_read(65535)
                 if o:
                     for r in _split_dtls(o):
-                        sock.sendto(r, dest)
+                        if sock.send(r) != len(r):
+                            raise OSError('incomplete UDP send')
             except SSL.WantReadError:
                 pass
+            except OSError:
+                sock.close()
+                send_failed = True
+            if send_failed:
+                raise EndpointError() from OSError('UDP send failed')
+            receive_failed = False
             try:
-                d, _ = sock.recvfrom(65535)
+                d = sock.recv(65535)
                 if d:
                     conn.bio_write(d)
             except socket.timeout:
                 pass
+            except OSError:
+                sock.close()
+                receive_failed = True
+            if receive_failed:
+                raise EndpointError() from OSError('UDP receive failed')
             time.sleep(0.05)
         else:
             sock.close()
@@ -255,6 +271,7 @@ class DtlsCoapSession:
         self.sock = sock
         self.conn = conn
         self.dest = dest
+        self.endpoint = endpoint
         self._stop.clear()
 
     def start_reader(self):
@@ -318,6 +335,8 @@ class DtlsCoapSession:
         self._observe_tokens.clear()
         self.sock = None
         self.conn = None
+        self.dest = None
+        self.endpoint = None
 
     # ---- send / receive plumbing -------------------------------------
 
@@ -350,6 +369,7 @@ class DtlsCoapSession:
         with self._send_lock:
             if self.conn is None:
                 raise SessionClosedError()
+            send_failed = False
             try:
                 self.conn.send(datagram)
                 self._last_send_ts = time.monotonic()
@@ -358,9 +378,14 @@ class DtlsCoapSession:
                     if not o:
                         break
                     for r in _split_dtls(o):
-                        self.sock.sendto(r, self.dest)
+                        if self.sock.send(r) != len(r):
+                            raise OSError('incomplete UDP send')
             except SSL.WantReadError:
                 pass
+            except OSError:
+                send_failed = True
+            if send_failed:
+                raise EndpointError() from OSError('UDP send failed')
 
     def _reader_loop(self):
         """Pump UDP socket → DTLS BIO → CoAP parser. Demuxes to pending
@@ -371,7 +396,7 @@ class DtlsCoapSession:
         try:
             while not self._stop.is_set():
                 try:
-                    d, _ = sock.recvfrom(65535)
+                    d = sock.recv(65535)
                 except socket.timeout:
                     continue
                 except (OSError, ValueError):
