@@ -81,16 +81,18 @@ def check_sdist(path: Path) -> None:
         raise DistributionError("sdist must contain one top-level directory")
     root = roots.pop()
     relative = {name[len(root) + 1 :] for name in names if name.startswith(f"{root}/")}
-    expected = _tracked_files() | {
-        ".gitignore",
-        ".hgignore",
+    required = _tracked_files() | {
         "LICENSE",
         "PKG-INFO",
         "README.md",
         "pyproject.toml",
         "smartthings_local/_version.py",
     }
-    if relative != expected:
+    # hatchling bundles the VCS ignore files it finds, but which ones ship
+    # depends on the hatchling version (newer releases drop .hgignore), so
+    # treat them as optional rather than exact members.
+    optional = {".gitignore", ".hgignore"}
+    if not required <= relative <= required | optional:
         raise DistributionError("sdist contents differ from the intended source set")
 
 
