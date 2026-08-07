@@ -560,3 +560,13 @@ If reconnects become persistent (e.g. >10 in a minute) something's wrong: check 
 ## Contributing
 
 If you submit a PR, please don't include real device UUIDs, MACs, serials, IPs, or bearer tokens. Use the placeholders from `.env.example`.
+
+---
+
+## Trademarks & disclaimer
+
+This is an independent, unofficial project. It is **not affiliated with, authorised, endorsed, or sponsored by Samsung Electronics Co., Ltd.** or any of its subsidiaries.
+
+"Samsung", "SmartThings", and any related names, marks, and logos are trademarks of Samsung Electronics Co., Ltd. They are used in this project **only nominatively** — to identify the hardware and protocols this software interoperates with — and no claim is made to any right in them. Use of these marks does not imply any affiliation with or endorsement by their owner.
+
+The software is provided under the [MIT License](LICENSE) for interoperability with hardware you own, without warranty of any kind.
