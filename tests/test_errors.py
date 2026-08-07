@@ -18,6 +18,7 @@ from smartthings_local.errors import (
 )
 from smartthings_local.protocol import dtls_session
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
+from smartthings_local.protocol.endpoint import ResolvedUdpEndpoint
 
 ERROR_TYPES = (
     EndpointError,
@@ -124,8 +125,13 @@ def test_handshake_error_is_classified_without_backend_text(monkeypatch):
     monkeypatch.setattr(dtls_session.SSL, 'Context', lambda *args: FakeContext())
     monkeypatch.setattr(
         dtls_session.SSL, 'Connection', lambda *args: FakeConnection())
+    endpoint = ResolvedUdpEndpoint(
+        dtls_session.socket.AF_INET, ('192.0.2.10', 5684))
     monkeypatch.setattr(
-        dtls_session.socket, 'socket', lambda *args: fake_socket)
+        dtls_session,
+        'open_connected_udp_socket',
+        lambda *args, **kwargs: (fake_socket, endpoint),
+    )
 
     session = DtlsCoapSession(
         'device.example', 5684,
