@@ -59,6 +59,7 @@ def check_wheel(path: Path) -> None:
         f"{dist_info}/METADATA",
         f"{dist_info}/WHEEL",
         f"{dist_info}/licenses/LICENSE",
+        f"{dist_info}/licenses/NOTICE",
         f"{dist_info}/RECORD",
     }
     if metadata != expected_metadata:
@@ -83,6 +84,7 @@ def check_sdist(path: Path) -> None:
     relative = {name[len(root) + 1 :] for name in names if name.startswith(f"{root}/")}
     required = _tracked_files() | {
         "LICENSE",
+        "NOTICE",
         "PKG-INFO",
         "README.md",
         "pyproject.toml",
