@@ -1,6 +1,6 @@
 # SmartThings-Local
 
-**`smartthings-local` is a Python library for local, cloud-free control of newer-generation Samsung connected appliances over cert-authenticated CoAP-DTLS.** It gives you the DTLS-CoAP transport, a tiered polling + OBSERVE state layer, and one-command identity-cert minting. That covers everything needed to read state from and write commands to a Samsung dryer, oven, fridge, etc. on your LAN, with no SmartThings cloud round-trip.
+**`smartthings-local` is a Python library for local, cloud-free control of Samsung connected appliances over authenticated CoAP-DTLS.** It gives you the DTLS-CoAP transport, a tiered polling + OBSERVE state layer, and identity-cert tooling for AC14K_M-compatible firmware. Newer OCF-PKI appliances require a different authentication profile; see [the laundry compatibility findings](https://github.com/QuiteYellow/SmartThings-Local/blob/main/docs/ocf-pki-laundry.md). Supported profiles can read state and write commands on the LAN with no SmartThings cloud round-trip.
 
 The repo also ships a self-contained **reference bridge demo** (`mqtt_demo/`) that turns the library into auto-discovered Home Assistant entities over MQTT. One process supervises multiple appliances, each on its own DTLS session.
 
@@ -21,14 +21,16 @@ The repo also ships a self-contained **reference bridge demo** (`mqtt_demo/`) th
 pip install smartthings-local
 ```
 
-Mint a client cert once (see [Part 2](#part-2--auth-get-the-identity-cert)), then drive a session directly:
+For compatible firmware, mint a client cert once (see
+[Part 2](#part-2--auth-for-ac14k_m-compatible-firmware)), then drive a
+session directly:
 
 ```python
 import cbor2
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 sess = DtlsCoapSession(
-    "192.168.1.100", 49154,
+    "192.0.2.100", 49154,
     cert_path="certs/client_fullchain.pem",
     key_path="certs/client.key",
 )
@@ -45,7 +47,7 @@ sess.close()
 If the cert/key are minted at runtime and never written to disk (e.g. inside an HA config flow), pass them in memory instead of by path:
 
 ```python
-sess = DtlsCoapSession("192.168.1.100", 49154, cert_pem=cert_pem, key_pem=key_pem)
+sess = DtlsCoapSession("192.0.2.100", 49154, cert_pem=cert_pem, key_pem=key_pem)
 ```
 
 ### Classified errors
@@ -127,7 +129,7 @@ For a full worked integration, the higher-level `smartthings_local.ocf` layer (`
 
 Each appliance runs an independent bridge built around three coordinated pieces over one persistent DTLS session: a `StateCache` (single source of truth for all reps), a `PollScheduler` (tiered adaptive polling: hot/warm/cold plus a periodic `/device/0` sweep), and a `KeepaliveTask` (CoAP empty-CON ping for DTLS-layer liveness, with consecutive-failure detection for MQTT availability). Tier cadences are descriptor-declared and were calibrated against the empirically-measured per-firmware ceilings: dryer ~14 req/s, oven ~8 req/s. OBSERVE registrations (RFC 7641) are kept as an opportunistic freshness accelerator: when the appliance has internet and emits notifications, the cache absorbs them and the next-poll timer is reset for that resource; when it's air-gapped, polling alone carries the UX with no other code change. Token-stable Block2 (RFC 7959) handles multi-block reads. Writes are optimistically merged into the cache the moment the device 2.04-confirms, with the scheduler deferring that resource's next poll past the fetchback-revert window. Reconnect with exponential backoff on session errors, gated by a stateless DTLS ClientHello pre-flight (`smartthings_local/protocol/dtls_probe.py`) so a silent/rebooting device or wrong port drops into backoff in ~1 RTT instead of eating the full handshake timeout; when `OCF_PORT` is unset the same probe auto-discovers the live port across the OCF band.
 
-Authentication uses a client cert keyed to the UUID published in Samsung's own wildcard cloud TLS cert. Every Samsung Tizen/RT-OCF appliance's factory ACL grants that UUID `perm=31` (full CRUDN) on `href=*`, so a single cert chain works across the whole fleet. Setup is one Python script.
+On the currently supported firmware families, authentication uses a client cert keyed to the UUID published in Samsung's own wildcard cloud TLS cert. Their factory ACL grants that UUID `perm=31` (full CRUDN) on `href=*`. That certificate path is not universal: the WD53 profile in issue #16 and the washer in issue #20 reject it and need separate authentication work.
 
 ---
 
@@ -136,23 +138,24 @@ Authentication uses a client cert keyed to the UUID published in Samsung's own w
 Check before anything else; if it's older firmware, this project doesn't target it.
 
 ```sh
-# UDP scan for DTLS-CoAP ports
-nmap -Pn -sU -p 49152-49160 "$APPLIANCE_IP"
+# UDP scan for public/secure standard OCF plus the dynamic appliance band
+nmap -Pn -sU -p 5683,5684,49152-49160 "$APPLIANCE_IP"
 ```
 
 Read the result:
 
-- **`49154/udp` (or similar 4915x) open|filtered with a DTLS handshake responding** → newer firmware (Tizen RT 3.x with DAWIT 3.0). This is what the bridge talks to.
+- **`5684/udp` or a 4915x port with a DTLS first-flight response** → an OCF DTLS listener. Standard-port OCF-PKI firmware may still require an unsupported authentication profile.
+- **`5683/udp` responds to public OCF security/resource GETs** → use `/oic/res` to learn the device's advertised secure endpoint; do not assume that endpoint is fixed.
 - **Only `8888/tcp` open (token-based HTTPS)** → older firmware (~2018–2022). **Not supported here.**
 
 nmap's `open|filtered` can't tell a real DTLS server from a silent UDP port. Confirm which of the candidate ports actually speaks DTLS with the ClientHello probe, which sends one ClientHello and reports back per port:
 
 ```sh
 # Stateless liveness check: one ClientHello round trip, leaves no state on the device
-python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 49153 49154 49155 49156 --stateless
+python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 5684 49153 49154 49155 49156 --stateless
 ```
 
-`live` means a DTLS server answered its `HelloVerifyRequest` (that's your control port); `dead` means silent / not DTLS. Once you have the client cert (Part 2), drop `--stateless` to run the default *diagnostic* drive, which reports `completed` (cert accepted) or `rejected` with the server's fatal alert. An `unsupported_certificate` / `unknown_ca` alert is the signature of a newer OCF-PKI device that won't accept the AC14K_M cert. The same probe gates the bridge's own reconnect loop and auto-discovers the port when `OCF_PORT` is unset.
+`live` means a DTLS server answered its first flight; `dead` means silent or not DTLS. Once you have the client cert (Part 2), add the explicit `--diagnostic` flag to run the stateful diagnostic drive, which reports `completed` (cert accepted) or `rejected` with the server's fatal alert. Diagnostic mode can allocate appliance-side DTLS state and is never used by discovery or reconnect. An `unsupported_certificate` / `unknown_ca` alert means the endpoint is reachable but this certificate profile was rejected. It is not a reason to disable verification or keep retrying. The same bounded stateless API gates the bridge's reconnect loop and, when `OCF_PORT` is unset, probes both standard 5684 and ports 49152–49160.
 
 ### Tested combinations
 
@@ -164,6 +167,13 @@ python -m smartthings_local.protocol.dtls_probe "$APPLIANCE_IP" 49153 49154 4915
 | Fridge | ARTIK051_REF_17K (`DA-REF-ART-COMMON-1_20201124`) | Contributed by [@aminorjourney](https://github.com/aminorjourney) (PR #1). Older firmware family; port 49155, minimal `/oic/res` with full tree under `/device/0` |
 
 Other appliances on the same firmware family (dishwashers, AC units) almost certainly speak the same protocol: the auth path and read primitives are common, and a washer on the shared `DA_WM_TP2_20_COMMON` controller is already confirmed above. You'd write one new descriptor for the `localthings` registry.
+
+The Bespoke AI Laundry Combo `WD53DBA900HZ[A1]` on Tizen 7 software
+`20260416.215549` is a known OCF-PKI profile, but is not yet supported by the
+public authentication path. Its endpoint and manufacturer-OTM/OwnerPSK findings
+are documented [here](https://github.com/QuiteYellow/SmartThings-Local/blob/main/docs/ocf-pki-laundry.md), including the exact relationship
+to issues [#16](https://github.com/QuiteYellow/SmartThings-Local/issues/16) and
+[#20](https://github.com/QuiteYellow/SmartThings-Local/issues/20).
 
 ### Firmware families: a limitation
 
@@ -188,9 +198,12 @@ Which path is doing the work is visible in Home Assistant. The bridge publishes 
 
 ---
 
-## Part 2 — Auth: get the identity cert
+## Part 2 — Auth for AC14K_M-compatible firmware
 
-The bridge authenticates with a **client cert** signed by `AC14K_M`, an intermediate CA that has been public for years and remains in current firmware trust stores. The cert's Subject DN carries a UUID that the on-device ACL grants full access to.
+For a compatible firmware family, the bridge authenticates with a **client
+cert** signed by `AC14K_M`, an intermediate CA that has been public for years.
+The cert's Subject DN carries a UUID that those appliances' on-device ACLs
+grant full access to.
 
 You can read the UUID yourself out of the relevant server cert:
 
@@ -207,7 +220,7 @@ This README doesn't pin the literal UUID: the setup script extracts it live each
 
 ### Why this works
 
-- Every Samsung Tizen/RT-OCF appliance has a **factory-baked ACE** in `/oic/sec/acl` granting this UUID `perm=31` on `href=*`.
+- Each currently supported Tizen/RT-OCF firmware family has a **factory-baked ACE** in `/oic/sec/acl` granting this UUID `perm=31` on `href=*`.
 - TizenRT iotivity derives peerId from `memmem(subject_dn, "uuid:")`, which is RDN-agnostic. A cert with the UUID in CN authenticates the same as one with it in OU.
 - We don't need the matching private key from the original keyholder. We mint our own key and have `AC14K_M` sign our leaf. Different key, same identity, same access.
 
@@ -234,9 +247,13 @@ Neither the UUID nor the AC14K_M bundle is hardcoded in this repo; both are fetc
 
 On Fedora/RHEL (and other hardened OpenSSL 3.x builds) the default crypto policy blocks SHA-1 signing, which step 5 needs. The script detects this, retries the signing step once with SHA-1 force-enabled for just that command, and only fails if the retry also fails. If it does, it prints the remedy: `sudo update-crypto-policies --set DEFAULT:SHA1` (undo afterward with `sudo update-crypto-policies --set DEFAULT`).
 
-### How durable is this?
+### How durable is this on the compatible firmware families?
 
-Rotating the published UUID would require Samsung to re-issue TLS certs across their IoT cloud, push new ACLs to every device in the field, and update the on-device daemon identity: a multi-quarter change with a long backwards-compat tail. `AC14K_M` has been public for years and is still in 2026 firmware trust stores. Local access via this path is roughly as durable as cloud control of these appliances.
+Rotating the published UUID would require coordinated cloud certificate, ACL,
+and device identity changes across the compatible firmware families.
+`AC14K_M` has been public for years and remains accepted by the tested rows
+above, but it is already rejected by other 2026 appliance profiles. Do not
+extrapolate this certificate path to an untested model.
 
 > **Legacy path:** earlier versions used a per-hub-UUID cert via an anonymous `/oic/sec/doxm` read escalation. That still works on the dryer-family firmware but isn't necessary: the cert minted here authenticates against every appliance and survives device resets. The old `bootstrap.py` for the legacy flow was removed when the package was renamed; see git history if you need it.
 
@@ -260,20 +277,21 @@ APPLIANCE_COUNT=2
 
 # Appliance 1 — dryer
 APPLIANCE_1_CLASS=dryer
-APPLIANCE_1_IP=192.168.1.100
+APPLIANCE_1_IP=192.0.2.100
 APPLIANCE_1_OCF_PORT=             # blank → auto-discover across the OCF band (dryer=49155)
 APPLIANCE_1_TOPIC=samsung_dryer
 APPLIANCE_1_NAME=Samsung Dryer
 
 # Appliance 2 — oven
 APPLIANCE_2_CLASS=oven
-APPLIANCE_2_IP=192.168.1.101
+APPLIANCE_2_IP=192.0.2.101
 APPLIANCE_2_OCF_PORT=             # blank → auto-discover across the OCF band (oven=49154)
 APPLIANCE_2_TOPIC=samsung_oven
 APPLIANCE_2_NAME=Samsung Oven
 ```
 
-Each `APPLIANCE_<n>_CLASS` must match a descriptor key in `mqtt_demo/samples/__init__.py::DESCRIPTORS`: currently `dryer`, `oven`, and `fridge`.
+Each `APPLIANCE_<n>_CLASS` must match a key in
+`mqtt_demo.samples.DESCRIPTORS`: currently `dryer`, `oven`, and `fridge`.
 
 ---
 
@@ -395,7 +413,7 @@ Notes specific to this firmware family:
 | `APPLIANCE_COUNT` | Number of `APPLIANCE_<n>_*` blocks to read (1-indexed) |
 | `APPLIANCE_<n>_CLASS` | Descriptor name: `dryer`, `oven`, `fridge` |
 | `APPLIANCE_<n>_IP` | LAN IP of the appliance |
-| `APPLIANCE_<n>_OCF_PORT` | Optional. Blank → auto-discover the DTLS port across the OCF band 49153–49156 (via a stateless ClientHello probe); set it to pin a specific port and skip discovery (dryer=49155, oven=49154, fridge=49155) |
+| `APPLIANCE_<n>_OCF_PORT` | Optional. Blank → probe standard port 5684 and the dynamic range 49152–49160 with a stateless ClientHello; set it to pin and gate one specific port (dryer=49155, oven=49154, fridge=49155) |
 | `APPLIANCE_<n>_TOPIC` | MQTT topic prefix (also the HA device identifier; changing it re-keys the device) |
 | `APPLIANCE_<n>_NAME` | Friendly name on the HA device card |
 | `MQTT_BROKER` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASS` | Broker config |
@@ -463,7 +481,7 @@ smartthings_local/                   The installable library — `pip install sm
     __init__.py
     coap.py                          CoAP wire protocol: message encode/decode, token handling
     dtls_session.py                  DTLS session: handshake, client-cert auth (file or in-memory PEM), Block2, liveness
-    dtls_probe.py                    DTLS ClientHello liveness probe (stateless gate + diagnostic mode)
+    dtls_probe.py                    Stateless DTLS liveness + opt-in stateful diagnostic
     ocf_root_ca.pem                  Samsung OCF root CA, bundled for handshake verification
   ocf/                               OCF resource + state layer (reusable)
     __init__.py

@@ -48,6 +48,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _OCF_ROOT_CA = str(Path(__file__).parent / 'ocf_root_ca.pem')
+_DTLS_CIPHERS = b'ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0'
 
 
 # Diagnostic logging — when DEBUG_BRIDGE=1 in env, the bridge dumps
@@ -202,7 +203,7 @@ class DtlsCoapSession:
         # intermediate is SHA-1 signed). This is the only channel that reaches
         # the OpenSSL instance cryptography bundles — ctypes and cffi bindings
         # do not expose SSL_CTX_set_security_level on this build.
-        ctx.set_cipher_list(b'ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0')
+        ctx.set_cipher_list(_DTLS_CIPHERS)
         if self.cert_pem is not None:
             _load_pem_chain(ctx, self.cert_pem, self.key_pem)
         else:
