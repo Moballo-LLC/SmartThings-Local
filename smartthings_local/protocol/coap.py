@@ -7,6 +7,8 @@ independently.
 """
 import struct
 
+from ..errors import MalformedMessageError
+
 # CoAP option numbers (RFC 7252 + 7641 + 7959)
 URI_PATH       = 11
 URI_QUERY      = 15
@@ -81,7 +83,7 @@ def parse_coap(data):
         elif d_nib == 14:
             delta = 269 + int.from_bytes(data[i:i + 2], 'big'); i += 2
         elif d_nib == 15:
-            raise ValueError("reserved option delta nibble 15")
+            raise MalformedMessageError()
         else:
             delta = d_nib
         if l_nib == 13:
@@ -89,7 +91,7 @@ def parse_coap(data):
         elif l_nib == 14:
             length = 269 + int.from_bytes(data[i:i + 2], 'big'); i += 2
         elif l_nib == 15:
-            raise ValueError("reserved option length nibble 15")
+            raise MalformedMessageError()
         else:
             length = l_nib
         num = prev + delta

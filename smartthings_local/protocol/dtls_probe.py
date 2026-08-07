@@ -33,6 +33,7 @@ import time
 
 from OpenSSL import SSL
 
+from ..errors import ProbeError
 from .coap import split_dtls
 from .dtls_session import _OCF_ROOT_CA, _load_pem_chain
 
@@ -214,10 +215,10 @@ def probe(host, port, *, cert_pem=None, key_pem=None,
                 break
             except SSL.WantReadError:
                 pass
-            except SSL.Error as e:
+            except SSL.Error:
                 # A fatal Alert lands here; the alert record was already
                 # captured below, so classification still works.
-                result.error = str(e)
+                result.error = ProbeError()
                 break
 
             try:

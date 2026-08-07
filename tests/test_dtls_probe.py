@@ -1,6 +1,7 @@
 import socket
 import time
 
+from smartthings_local.errors import ProbeError
 from smartthings_local.protocol import dtls_probe as p
 
 
@@ -156,4 +157,4 @@ def test_diagnostic_mode_feeds_server_flight_back(monkeypatch):
     _patch_sock(monkeypatch, fake)
     r = p.probe('127.0.0.1', 5684, stateless=False, timeout=3.0)
     assert r.outcome == p.LIVE           # HVR still proved liveness
-    assert r.error is not None           # OpenSSL processed the fed-back flight
+    assert isinstance(r.error, ProbeError)  # OpenSSL processed the flight

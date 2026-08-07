@@ -27,6 +27,12 @@ from pathlib import Path
 
 from OpenSSL import SSL
 
+from ..errors import (
+    BlockwiseError,
+    SessionClosedError,
+    SessionError,
+    SessionTimeoutError,
+)
 from .coap import (
     URI_PATH, URI_QUERY, OBSERVE, CONTENT_FORMAT, ACCEPT, BLOCK2, SIZE2,
     TYPE_CON, TYPE_NON, TYPE_ACK, TYPE_RST,
@@ -215,15 +221,17 @@ class DtlsCoapSession:
         dest = (self.host, self.port)
 
         t0 = time.time()
+        backend_failed = False
         while time.time() - t0 < self.HANDSHAKE_TIMEOUT_S:
             try:
                 conn.do_handshake()
                 break
             except SSL.WantReadError:
                 pass
-            except SSL.Error as e:
+            except SSL.Error:
                 sock.close()
-                raise ConnectionError(f"DTLS handshake error: {e}") from e
+                backend_failed = True
+                break
             try:
                 o = conn.bio_read(65535)
                 if o:
@@ -240,8 +248,9 @@ class DtlsCoapSession:
             time.sleep(0.05)
         else:
             sock.close()
-            raise TimeoutError(
-                f"DTLS handshake timeout to {self.host}:{self.port}")
+            raise SessionTimeoutError()
+        if backend_failed:
+            raise SessionError() from ConnectionError('DTLS backend failed')
 
         self.sock = sock
         self.conn = conn
@@ -303,7 +312,7 @@ class DtlsCoapSession:
             except Exception:
                 pass
         for tok, (ev, container) in list(self._pending.items()):
-            container.setdefault('err', 'socket closed')
+            container.setdefault('err', SessionClosedError())
             ev.set()
         self._pending.clear()
         self._observe_tokens.clear()
@@ -340,7 +349,7 @@ class DtlsCoapSession:
         BIO-drain so two writers can't interleave records."""
         with self._send_lock:
             if self.conn is None:
-                raise ConnectionError("DTLS session closed")
+                raise SessionClosedError()
             try:
                 self.conn.send(datagram)
                 self._last_send_ts = time.monotonic()
@@ -412,7 +421,7 @@ class DtlsCoapSession:
         finally:
             # Make sure pending waiters don't hang if the reader dies.
             for tok, (ev, container) in list(self._pending.items()):
-                container.setdefault('err', 'reader exited')
+                container.setdefault('err', SessionClosedError())
                 ev.set()
 
     def _dispatch_coap(self, datagram):
@@ -482,7 +491,7 @@ class DtlsCoapSession:
         token, and dropping a fresh token on block 1+ silently drops
         the request."""
         if self.conn is None:
-            raise ConnectionError("DTLS session closed")
+            raise SessionClosedError()
         tok = self._next_tok()
         blob = b''
         num = 0
@@ -518,8 +527,7 @@ class DtlsCoapSession:
                             "GET %s /%s block %d: timed out after %d attempt(s)",
                             self.host, '/'.join(path_segs), num, attempt + 1,
                         )
-                        raise TimeoutError(
-                            f"GET /{'/'.join(path_segs)} block {num} timeout")
+                        raise SessionTimeoutError()
                     logger.debug(
                         "GET %s /%s block %d: attempt %d/%d timeout, retrying",
                         self.host, '/'.join(path_segs), num,
@@ -528,7 +536,7 @@ class DtlsCoapSession:
                 finally:
                     self._pending.pop(tok, None)
             if 'err' in container:
-                raise ConnectionError(container['err'])
+                raise container['err']
 
             code = container['code']
             payload = container['payload']
@@ -552,16 +560,14 @@ class DtlsCoapSession:
                 break
             num += 1
             if num > self.MAX_BLOCKS:
-                raise ConnectionError(
-                    f"GET /{'/'.join(path_segs)}: >{self.MAX_BLOCKS} "
-                    f"blocks, aborting")
+                raise BlockwiseError()
         return last_code, blob
 
     def post(self, path_segs, body_cbor, timeout=8.0):
         """Single-frame POST with a CBOR-encoded body. Returns
         (code, payload_bytes). body_cbor must already be encoded."""
         if self.conn is None:
-            raise ConnectionError("DTLS session closed")
+            raise SessionClosedError()
         tok = self._next_tok()
         mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
@@ -575,10 +581,9 @@ class DtlsCoapSession:
         try:
             self._send_dgram(datagram)
             if not ev.wait(timeout):
-                raise TimeoutError(
-                    f"POST /{'/'.join(path_segs)} timeout")
+                raise SessionTimeoutError()
             if 'err' in container:
-                raise ConnectionError(container['err'])
+                raise container['err']
             return container['code'], container['payload']
         finally:
             self._pending.pop(tok, None)
@@ -596,7 +601,7 @@ class DtlsCoapSession:
         `last_success_ts`, surfaced through KeepaliveTask's
         `liveness_fn`."""
         if self.conn is None:
-            raise ConnectionError("DTLS session closed")
+            raise SessionClosedError()
         mid = self._next_mid()
         self._send_dgram(build_coap(TYPE_CON, 0, mid, b'', []))
         return mid
@@ -614,7 +619,7 @@ class DtlsCoapSession:
         old token gets dropped as 'stale' — acceptable for a 6h-scale
         safety net."""
         if self.conn is None:
-            raise ConnectionError("DTLS session closed")
+            raise SessionClosedError()
         for tok, href in list(self._observe_tokens.items()):
             segs = [s for s in href.split('/') if s]
             try:
@@ -638,7 +643,7 @@ class DtlsCoapSession:
         Returns the token used (in case the caller wants to deregister
         later)."""
         if self.conn is None:
-            raise ConnectionError("DTLS session closed")
+            raise SessionClosedError()
         tok = self._next_observe_tok()
         href = '/' + '/'.join(path_segs)
         # Register the token BEFORE sending — otherwise the device

@@ -1,3 +1,6 @@
+import pytest
+
+from smartthings_local.errors import MalformedMessageError
 from smartthings_local.protocol.coap import (
     build_coap, parse_coap, encode_options, block_value, fmt_code,
     TYPE_CON, METHOD_GET, URI_PATH, ACCEPT, CF_CBOR, BLOCK2,
@@ -43,3 +46,13 @@ def test_block_value_promotes_to_two_bytes_when_num_is_large():
 def test_fmt_code_formats_class_dot_detail():
     assert fmt_code(0x45) == '2.05'
     assert fmt_code(0x84) == '4.04'
+
+
+@pytest.mark.parametrize('option_header', (b'\xf0', b'\x0f'))
+def test_reserved_option_nibbles_raise_classified_value_error(option_header):
+    datagram = b'\x40\x01\x00\x01' + option_header
+
+    with pytest.raises(MalformedMessageError) as exc:
+        parse_coap(datagram)
+
+    assert isinstance(exc.value, ValueError)
