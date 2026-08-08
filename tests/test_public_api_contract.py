@@ -6,7 +6,11 @@ import inspect
 
 from smartthings_local.ocf.observe_refresh import ObserveRefreshTask
 from smartthings_local.ocf.state_cache import StateCache
-from smartthings_local.protocol.auth import AuthenticationProvider, CertificateAuth
+from smartthings_local.protocol.auth import (
+    AuthenticationProvider,
+    CertificateAuth,
+    PskAuth,
+)
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 
@@ -49,6 +53,18 @@ def test_dtls_session_constructor_keeps_file_memory_and_local_port_inputs():
 def test_certificate_auth_is_a_public_authentication_provider():
     provider = CertificateAuth.from_files("/synthetic/cert.pem", "/synthetic/key")
     assert isinstance(provider, AuthenticationProvider)
+
+
+def test_psk_auth_is_a_public_authentication_provider():
+    provider = PskAuth(identity=b"i" * 16, key=b"k" * 16)
+    assert isinstance(provider, AuthenticationProvider)
+    parameters = inspect.signature(PskAuth).parameters
+    assert list(parameters) == ["identity", "key"]
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+        for parameter in parameters.values()
+    )
 
 
 def test_dtls_session_keeps_current_consumer_methods():

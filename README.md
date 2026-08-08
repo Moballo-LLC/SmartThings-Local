@@ -61,6 +61,21 @@ For compatibility, the existing `cert_path` / `key_path` and `cert_pem` /
 They are routed through `CertificateAuth` internally. Do not combine `auth`
 with those legacy arguments.
 
+An existing OCF PSK credential can be supplied through `PskAuth`:
+
+```python
+from smartthings_local.protocol.auth import PskAuth
+
+auth = PskAuth(identity=psk_identity, key=psk_key)
+sess = DtlsCoapSession("192.0.2.100", 49154, auth=auth)
+```
+
+The identity must be the raw 16-byte OCF UUID and cannot contain a NUL byte;
+the key must be exactly 16 or 32 bytes. `PskAuth` selects only
+`ECDHE-PSK-AES128-CBC-SHA256` and does not acquire, derive, provision, rotate,
+or persist credentials. Ownership transfer and credential discovery are
+outside this package.
+
 ### Classified errors
 
 Runtime transport failures use the public types in
