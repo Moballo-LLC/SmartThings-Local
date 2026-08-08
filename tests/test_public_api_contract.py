@@ -10,6 +10,9 @@ from smartthings_local.protocol.auth import (
     AuthenticationProvider,
     CertificateAuth,
     PskAuth,
+    SamsungServerProfile,
+    SamsungServerRole,
+    ServerCertificateAuth,
 )
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
@@ -53,6 +56,47 @@ def test_dtls_session_constructor_keeps_file_memory_and_local_port_inputs():
 def test_certificate_auth_is_a_public_authentication_provider():
     provider = CertificateAuth.from_files("/synthetic/cert.pem", "/synthetic/key")
     assert isinstance(provider, AuthenticationProvider)
+
+    for factory in (CertificateAuth.from_files, CertificateAuth.from_memory):
+        profile_parameter = inspect.signature(factory).parameters["server_profile"]
+        assert profile_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert profile_parameter.default is None
+
+
+def test_samsung_server_profile_is_public_and_explicitly_bound():
+    parameters = inspect.signature(SamsungServerProfile.bound_device).parameters
+    assert list(parameters) == [
+        "expected_certificate_identity",
+        "role",
+        "additional_ca_pem",
+    ]
+    assert (
+        parameters["expected_certificate_identity"].default
+        is inspect.Parameter.empty
+    )
+    assert parameters["role"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["role"].default is SamsungServerRole.HOME_APPLIANCE
+    assert parameters["additional_ca_pem"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["additional_ca_pem"].default is None
+
+
+def test_server_certificate_auth_is_a_public_authentication_provider():
+    profile = SamsungServerProfile.bound_device(
+        "abababab-abab-abab-abab-abababababab",
+        role=SamsungServerRole.VD_DEVICE,
+    )
+    provider = ServerCertificateAuth(server_profile=profile)
+    assert isinstance(provider, AuthenticationProvider)
+    session = DtlsCoapSession("device.example", 5684, auth=provider)
+    assert session.auth is provider
+    assert session.cert_path is None
+    assert session.key_path is None
+    assert session.cert_pem is None
+    assert session.key_pem is None
+    parameters = inspect.signature(ServerCertificateAuth).parameters
+    assert list(parameters) == ["server_profile"]
+    assert parameters["server_profile"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["server_profile"].default is inspect.Parameter.empty
 
 
 def test_psk_auth_is_a_public_authentication_provider():
