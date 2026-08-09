@@ -7,10 +7,15 @@ from os import PathLike
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from OpenSSL import SSL, crypto
+from OpenSSL import SSL, _util, crypto
 
 _OCF_ROOT_CA = str(Path(__file__).with_name("ocf_root_ca.pem"))
 _DTLS_CIPHERS = b"ECDHE-ECDSA-AES128-GCM-SHA256:@SECLEVEL=0"
+_DTLS_PSK_CIPHERS = b"ECDHE-PSK-AES128-CBC-SHA256:@SECLEVEL=0"
+_PSK_CLIENT_CALLBACK_CDEF = (
+    "unsigned int (*)(SSL *, char *, char *, unsigned int, "
+    "unsigned char *, unsigned int)"
+)
 _PEM_CERT_RE = re.compile(
     rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
     re.DOTALL,
@@ -45,7 +50,7 @@ class AuthenticationProvider(Protocol):
     """Configure authentication for a newly created DTLS context."""
 
     def configure_context(self, context: SSL.Context) -> None:
-        """Configure trust, verification, ciphers, and client credentials."""
+        """Configure a context while this provider remains session-owned."""
 
 
 class CertificateAuth:
@@ -164,4 +169,78 @@ class CertificateAuth:
             context.check_privatekey()
 
 
-__all__ = ["AuthenticationProvider", "CertificateAuth"]
+class PskAuth:
+    """DTLS authentication using an existing OCF PSK credential.
+
+    The identity must be a raw 16-byte OCF UUID. The key must contain 16 or
+    32 bytes. Credential material is intentionally not exposed as public
+    attributes and is never included in this provider's representation. A
+    configured context must not outlive this provider; ``DtlsCoapSession``
+    enforces that lifetime by retaining its provider.
+    """
+
+    __slots__ = ("_callback",)
+
+    def __init__(self, *, identity: bytes, key: bytes) -> None:
+        if type(identity) is not bytes or type(key) is not bytes:
+            raise TypeError("identity and key must be bytes")
+        if len(identity) != 16:
+            raise ValueError("identity must be a raw 16-byte OCF UUID")
+        if b"\x00" in identity:
+            raise ValueError("identity cannot contain a NUL byte")
+        if len(key) not in (16, 32):
+            raise ValueError("key must be 16 or 32 bytes")
+
+        ffi = _util.ffi
+
+        @ffi.callback(_PSK_CLIENT_CALLBACK_CDEF)
+        def client_callback(
+            _ssl,
+            _identity_hint,
+            identity_buffer,
+            max_identity_length,
+            key_buffer,
+            max_key_length,
+        ):
+            # OpenSSL callbacks cannot propagate Python exceptions. Fail
+            # before touching either destination when a buffer is unavailable
+            # or too small for the complete credential.
+            if (
+                identity_buffer == ffi.NULL
+                or key_buffer == ffi.NULL
+                or len(identity) + 1 > max_identity_length
+                or len(key) > max_key_length
+            ):
+                return 0
+            ffi.memmove(
+                identity_buffer,
+                identity + b"\x00",
+                len(identity) + 1,
+            )
+            ffi.memmove(key_buffer, key, len(key))
+            return len(key)
+
+        object.__setattr__(self, "_callback", client_callback)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("PskAuth is immutable")
+
+    def __delattr__(self, _name: str) -> None:
+        raise AttributeError("PskAuth is immutable")
+
+    def __repr__(self) -> str:
+        """Return a representation that never includes credential material."""
+        return "PskAuth()"
+
+    def configure_context(self, context: SSL.Context) -> None:
+        """Configure one context for the narrow Samsung OCF PSK profile."""
+        setter = getattr(_util.lib, "SSL_CTX_set_psk_client_callback", None)
+        if setter is None:
+            raise RuntimeError(
+                "the installed OpenSSL binding does not support DTLS PSK"
+            )
+        context.set_cipher_list(_DTLS_PSK_CIPHERS)
+        setter(context._context, self._callback)  # noqa: SLF001
+
+
+__all__ = ["AuthenticationProvider", "CertificateAuth", "PskAuth"]
