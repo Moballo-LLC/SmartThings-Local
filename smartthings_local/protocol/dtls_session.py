@@ -49,7 +49,11 @@ from .auth import (
     _OCF_ROOT_CA,
     _load_pem_chain,
 )
-from .dtls_handshake import _HANDSHAKE_POLL_S, _drive_dtls_handshake
+from .dtls_handshake import (
+    _HANDSHAKE_POLL_S,
+    _HandshakeCancelled,
+    _drive_dtls_handshake,
+)
 from .endpoint import open_connected_udp_socket
 import logging
 
@@ -103,6 +107,61 @@ def _validate_handshake_timeout(timeout, default):
     if not math.isfinite(value) or value <= 0:
         raise ValueError('timeout must be a positive finite number or None')
     return value
+
+
+class ConnectCancellation:
+    """One-way, socket-backed cancellation signal for ``connect()``.
+
+    Each active connection attempt receives its own wake socket. ``set()``
+    makes every subscribed socket readable immediately, without a polling
+    thread or a session-level abort API.
+    """
+
+    __slots__ = ("_is_set", "_lock", "_writers")
+
+    def __init__(self) -> None:
+        self._is_set = False
+        self._lock = threading.Lock()
+        self._writers: set[socket.socket] = set()
+
+    def set(self) -> None:
+        """Cancel current and future connection attempts using this signal."""
+        with self._lock:
+            if self._is_set:
+                return
+            self._is_set = True
+            for writer in self._writers:
+                try:
+                    writer.send(b"\0")
+                except OSError:
+                    pass
+
+    def is_set(self) -> bool:
+        """Return whether cancellation has been requested."""
+        with self._lock:
+            return self._is_set
+
+    def _subscribe(self) -> tuple[socket.socket, socket.socket]:
+        reader, writer = socket.socketpair()
+        reader.setblocking(False)
+        with self._lock:
+            self._writers.add(writer)
+            if self._is_set:
+                writer.send(b"\0")
+        return reader, writer
+
+    def _unsubscribe(
+        self,
+        reader: socket.socket,
+        writer: socket.socket,
+    ) -> bool:
+        with self._lock:
+            self._writers.discard(writer)
+            interrupted = self._is_set
+        reader.close()
+        writer.close()
+        return interrupted
+
 
 class DtlsCoapSession:
     """Single sustained DTLS-CoAP session.
@@ -215,22 +274,37 @@ class DtlsCoapSession:
 
     # ---- lifecycle ---------------------------------------------------
 
-    def connect(self, *, timeout: float | None = None):
-        """Perform a DTLS handshake within a monotonic deadline.
+    def connect(
+        self,
+        *,
+        timeout: float | None = None,
+        cancel: ConnectCancellation | None = None,
+    ):
+        """Perform a cancellable DTLS handshake within a monotonic deadline.
 
         ``timeout`` overrides ``HANDSHAKE_TIMEOUT_S`` for this call. OpenSSL
         owns DTLS retransmission timing while every receive is capped by the
         remaining budget, so wall-clock adjustments cannot change the bound.
+        A ``ConnectCancellation`` wakes the network wait immediately and does
+        not alter an already established session.
         """
         handshake_timeout = _validate_handshake_timeout(
             timeout, self.HANDSHAKE_TIMEOUT_S)
+        if cancel is not None and not isinstance(cancel, ConnectCancellation):
+            raise TypeError("cancel must be a ConnectCancellation or None")
+        if cancel is not None and cancel.is_set():
+            raise SessionClosedError()
         deadline = time.monotonic() + handshake_timeout
         ctx = SSL.Context(SSL.DTLS_METHOD)
         self.auth.configure_context(ctx)
+        if cancel is not None and cancel.is_set():
+            raise SessionClosedError()
 
         conn = SSL.Connection(ctx, None)
         conn.set_connect_state()
         conn.set_ciphertext_mtu(self.mtu)
+        if cancel is not None and cancel.is_set():
+            raise SessionClosedError()
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -243,19 +317,51 @@ class DtlsCoapSession:
             timeout=min(_HANDSHAKE_POLL_S, remaining),
         )
         dest = endpoint.sockaddr
+        if cancel is not None and cancel.is_set():
+            sock.close()
+            raise SessionClosedError()
+
+        wake_subscription = None
+        subscription_failed = False
+        if cancel is not None:
+            try:
+                wake_subscription = cancel._subscribe()
+            except OSError:
+                subscription_failed = True
+        if subscription_failed:
+            sock.close()
+            raise SessionError() from OSError(
+                "connection cancellation setup failed"
+            )
 
         backend_failed = False
         io_failed = False
+        cancelled = False
+        interrupted = False
         try:
-            completed = _drive_dtls_handshake(
-                conn,
-                sock,
-                deadline=deadline,
-            )
-        except SSL.Error:
-            backend_failed = True
-        except OSError:
-            io_failed = True
+            try:
+                completed = _drive_dtls_handshake(
+                    conn,
+                    sock,
+                    deadline=deadline,
+                    wake_socket=(
+                        wake_subscription[0]
+                        if wake_subscription is not None
+                        else None
+                    ),
+                )
+            except _HandshakeCancelled:
+                cancelled = True
+            except SSL.Error:
+                backend_failed = True
+            except OSError:
+                io_failed = True
+        finally:
+            if wake_subscription is not None:
+                interrupted = cancel._unsubscribe(*wake_subscription)
+        if cancelled or interrupted:
+            sock.close()
+            raise SessionClosedError()
         if backend_failed:
             sock.close()
             raise SessionError() from ConnectionError('DTLS backend failed')

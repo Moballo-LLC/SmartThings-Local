@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import select
 import time
 from collections.abc import Callable
 
@@ -13,6 +14,10 @@ _HANDSHAKE_POLL_S = 0.5
 _MAX_DATAGRAM_SIZE = 65535
 
 
+class _HandshakeCancelled(Exception):
+    """Internal signal that a handshake wake socket became readable."""
+
+
 def _drive_dtls_handshake(
     connection,
     sock,
@@ -20,6 +25,7 @@ def _drive_dtls_handshake(
     deadline: float,
     retries: int | None = None,
     on_datagram: Callable[[bytes], None] | None = None,
+    wake_socket=None,
 ) -> bool:
     """Drive one memory-BIO DTLS handshake up to a monotonic deadline.
 
@@ -51,10 +57,29 @@ def _drive_dtls_handshake(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        sock.settimeout(min(_HANDSHAKE_POLL_S, remaining))
-        try:
-            datagram = sock.recv(_MAX_DATAGRAM_SIZE)
-        except TimeoutError:
+        wait = min(_HANDSHAKE_POLL_S, remaining)
+        timed_out = False
+        if wake_socket is None:
+            sock.settimeout(wait)
+            try:
+                datagram = sock.recv(_MAX_DATAGRAM_SIZE)
+            except TimeoutError:
+                timed_out = True
+        else:
+            readable, _, _ = select.select(
+                (sock, wake_socket),
+                (),
+                (),
+                wait,
+            )
+            if wake_socket in readable:
+                raise _HandshakeCancelled()
+            if sock not in readable:
+                timed_out = True
+            else:
+                datagram = sock.recv(_MAX_DATAGRAM_SIZE)
+
+        if timed_out:
             timer = connection.DTLSv1_get_timeout()
             if timer is not None and timer <= 0:
                 if retries is not None and retransmits >= retries:
