@@ -81,6 +81,12 @@ def test_dtls_session_keeps_current_consumer_methods():
         "subscribe",
     }
     assert expected <= set(dir(DtlsCoapSession))
+    _assert_compatible_signature(DtlsCoapSession.connect, ["self"])
+    connect_timeout = inspect.signature(DtlsCoapSession.connect).parameters[
+        "timeout"
+    ]
+    assert connect_timeout.kind is inspect.Parameter.KEYWORD_ONLY
+    assert connect_timeout.default is None
     _assert_compatible_signature(
         DtlsCoapSession.get,
         [
