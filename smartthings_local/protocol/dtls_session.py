@@ -18,6 +18,7 @@ Reader thread owns the UDP socket. Callers issue get()/post() and block
 on a per-token Event the reader signals. OBSERVE notifications are
 delivered via the on_notification callback.
 """
+import errno
 import os
 import socket
 import threading
@@ -71,6 +72,21 @@ _BLOCK_ACK_TIMEOUT  = 4.0
 # (200 ms) is conservative enough for all tested devices; tune per device
 # once the ceiling is measured empirically.
 _DEFAULT_RATE_LIMIT_RPS = 5.0
+
+# ICMP errors a connected UDP socket surfaces on the next recv. On these
+# appliances they show up while the device is rebooting, while it holds an
+# orphaned association, or across a router blip, and the next datagram
+# usually works. UDP delivery was never guaranteed, so treat them as
+# advisory and keep reading. Unconnected sockets never see any of this,
+# which is why the reader survived them before the connected-socket change
+# in d677c72 (v0.1.3).
+_ADVISORY_ERRNOS = frozenset(
+    value for value in (
+        getattr(errno, name, None)
+        for name in ('ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH',
+                     'EHOSTDOWN', 'ENETDOWN')
+    ) if value is not None
+)
 
 class DtlsCoapSession:
     """Single sustained DTLS-CoAP session.
@@ -168,6 +184,10 @@ class DtlsCoapSession:
 
         self._stop = threading.Event()
         self._reader_thread = None
+        # Set while the reader owns the socket. Cleared when it exits for
+        # any reason, so callers fail fast through _check_live() instead of
+        # waiting out a request timeout against a session nobody is reading.
+        self._reader_running = threading.Event()
         self._last_send_ts = 0.0
 
     def pace(self) -> None:
@@ -253,10 +273,26 @@ class DtlsCoapSession:
         """Spawn the reader thread. Must be called after connect()."""
         if self.sock is None:
             raise RuntimeError("connect() before start_reader()")
+        self._reader_running.set()
         t = threading.Thread(target=self._reader_loop,
                              daemon=True, name='dtls-reader')
         t.start()
         self._reader_thread = t
+
+    def _check_live(self):
+        """Raise if the session cannot carry a request. A dead reader is
+        as fatal as a closed connection: the socket may still accept
+        sends, but no response will ever be dispatched, so waiting out the
+        request timeout only delays the inevitable SessionClosedError.
+
+        Callers that never start a reader (config-flow style) keep the old
+        behaviour — only the conn check applies while _reader_thread is
+        None."""
+        if self.conn is None:
+            raise SessionClosedError()
+        if self._reader_thread is not None and \
+                not self._reader_running.is_set():
+            raise SessionClosedError()
 
     def join(self):
         """Block until the reader thread exits (i.e. socket dies)."""
@@ -374,7 +410,23 @@ class DtlsCoapSession:
                     d = sock.recv(65535)
                 except socket.timeout:
                     continue
-                except (OSError, ValueError):
+                except OSError as e:
+                    if self._stop.is_set():
+                        return          # close() got here first
+                    if e.errno in _ADVISORY_ERRNOS:
+                        logger.debug("reader: advisory %s from %s, continuing",
+                                     errno.errorcode.get(e.errno, e.errno),
+                                     self.host)
+                        continue
+                    logger.warning("reader exiting: socket error %s from %s",
+                                   errno.errorcode.get(e.errno, e.errno),
+                                   self.host)
+                    return
+                except ValueError:
+                    # recv on a socket closed underneath the reader.
+                    if not self._stop.is_set():
+                        logger.warning("reader exiting: socket closed "
+                                       "underneath it")
                     return
                 if not d:
                     continue
@@ -419,6 +471,8 @@ class DtlsCoapSession:
                 if exit_reader:
                     return
         finally:
+            # Reader no longer owns the socket — callers must fail fast.
+            self._reader_running.clear()
             # Make sure pending waiters don't hang if the reader dies.
             for tok, (ev, container) in list(self._pending.items()):
                 container.setdefault('err', SessionClosedError())
@@ -490,8 +544,7 @@ class DtlsCoapSession:
         response — Samsung's server keys per-transfer state on the
         token, and dropping a fresh token on block 1+ silently drops
         the request."""
-        if self.conn is None:
-            raise SessionClosedError()
+        self._check_live()
         tok = self._next_tok()
         blob = b''
         num = 0
@@ -566,8 +619,7 @@ class DtlsCoapSession:
     def post(self, path_segs, body_cbor, timeout=8.0):
         """Single-frame POST with a CBOR-encoded body. Returns
         (code, payload_bytes). body_cbor must already be encoded."""
-        if self.conn is None:
-            raise SessionClosedError()
+        self._check_live()
         tok = self._next_tok()
         mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
@@ -600,8 +652,7 @@ class DtlsCoapSession:
         Real half-open-session detection lives in PollScheduler's
         `last_success_ts`, surfaced through KeepaliveTask's
         `liveness_fn`."""
-        if self.conn is None:
-            raise SessionClosedError()
+        self._check_live()
         mid = self._next_mid()
         self._send_dgram(build_coap(TYPE_CON, 0, mid, b'', []))
         return mid
@@ -618,8 +669,7 @@ class DtlsCoapSession:
         tokens via subscribe. Brief race window where a notify on the
         old token gets dropped as 'stale' — acceptable for a 6h-scale
         safety net."""
-        if self.conn is None:
-            raise SessionClosedError()
+        self._check_live()
         for tok, href in list(self._observe_tokens.items()):
             segs = [s for s in href.split('/') if s]
             try:
@@ -642,8 +692,7 @@ class DtlsCoapSession:
 
         Returns the token used (in case the caller wants to deregister
         later)."""
-        if self.conn is None:
-            raise SessionClosedError()
+        self._check_live()
         tok = self._next_observe_tok()
         href = '/' + '/'.join(path_segs)
         # Register the token BEFORE sending — otherwise the device
