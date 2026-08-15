@@ -81,6 +81,76 @@ auth = CertificateAuth.from_memory(cert_pem, key_pem)
 sess = DtlsCoapSession("192.0.2.100", 49154, auth=auth)
 ```
 
+Some newer OCF-PKI devices require an exact Samsung DTLS offer and present a
+hardware certificate whose subject contains a certificate UUID. That UUID can
+be distinct from the runtime OCF device UUID reported by `/oic/d`, so callers
+must obtain and verify the certificate identity independently. When the caller
+already has an authorized client certificate and a previously verified
+hardware-certificate UUID, opt in to both requirements explicitly:
+
+```python
+from smartthings_local.protocol.auth import (
+    CertificateAuth,
+    SamsungServerProfile,
+)
+
+server_profile = SamsungServerProfile.bound_device(
+    expected_certificate_uuid,
+    additional_ca_pem=additional_samsung_ca_pem,
+)
+auth = CertificateAuth.from_memory(
+    cert_pem,
+    key_pem,
+    server_profile=server_profile,
+)
+sess = DtlsCoapSession("192.0.2.100", 49154, auth=auth)
+```
+
+The default profile is restricted to Samsung home-appliance leaves with
+`OU=OCF HA Device`. The profile limits the ClientHello to P-256,
+`ECDHE-ECDSA-AES128-GCM-SHA256`, and the observed SHA-256/SHA-1 RSA/ECDSA
+signature set, disables session tickets, preserves certificate-chain
+verification, and requires the exact subject role
+`C=KR, O=Samsung Electronics, OU=OCF HA Device` with a common name ending in
+the expected certificate UUID. `additional_ca_pem` is optional and accepts
+only a bounded PEM CA-certificate chain; it is applied only to this profiled
+context. Without a profile, `CertificateAuth` retains its existing verification
+behavior.
+
+Samsung VD-family devices can present the same wire profile with the distinct
+`OU=OCF VD Device` role. Select that role explicitly; profiles never fall back
+between device classes:
+
+```python
+from smartthings_local.protocol.auth import (
+    SamsungServerProfile,
+    SamsungServerRole,
+    ServerCertificateAuth,
+)
+
+server_profile = SamsungServerProfile.bound_device(
+    expected_certificate_uuid,
+    role=SamsungServerRole.VD_DEVICE,
+)
+auth = ServerCertificateAuth(server_profile=server_profile)
+sess = DtlsCoapSession("192.0.2.100", 5684, auth=auth)
+```
+
+`ServerCertificateAuth` is for a server-authenticated channel that does not
+send a client certificate, such as the initial DTLS carrier used by
+manufacturer-certificate OTM. It still verifies the CA chain, exact selected
+subject role, and pinned certificate UUID. It does not learn an identity from
+the first endpoint it reaches and cannot be combined with client credentials.
+
+This API deliberately does not discover, mint, authorize, provision, rotate,
+or persist credentials, and it performs no ownership transfer or OCF security
+resource writes. In particular, the server-only provider can authenticate the
+initial manufacturer-certificate channel, but it does not implement the OTM
+that follows. The already-owned new-PKI case in
+[issue #16](https://github.com/QuiteYellow/SmartThings-Local/issues/16) still
+requires an authorized client identity before ordinary protected resources
+can be used.
+
 For compatibility, the existing `cert_path` / `key_path` and `cert_pem` /
 `key_pem` session arguments remain supported without a deprecation warning.
 They are routed through `CertificateAuth` internally. Do not combine `auth`
