@@ -34,14 +34,16 @@ def _drive_dtls_handshake(
     bounded only by its deadline, while the diagnostic probe retains its
     explicit retry budget.
 
-    Return ``True`` only when the handshake completes before the deadline.
-    TLS and socket failures are left to the caller to classify.
+    Return ``True`` once OpenSSL reports the handshake complete. The deadline
+    prevents another setup, retry, or network-wait iteration; it does not tear
+    down a session that completed while ``do_handshake()`` was running. TLS and
+    socket failures are left to the caller to classify.
     """
     retransmits = 0
     while time.monotonic() < deadline:
         try:
             connection.do_handshake()
-            return time.monotonic() < deadline
+            return True
         except SSL.WantReadError:
             pass
 

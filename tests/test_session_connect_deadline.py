@@ -323,12 +323,12 @@ def test_connect_services_openssl_retransmit_timer(monkeypatch):
 
 
 @pytest.mark.parametrize("success_delay", (0.1, 0.2))
-def test_handshake_success_at_or_after_deadline_is_rejected(
+def test_handshake_success_at_or_after_deadline_is_retained(
     monkeypatch,
     success_delay,
 ):
     clock = _Clock()
-    connection, sock, _endpoint, _open_calls = _install_handshake(
+    connection, sock, endpoint, _open_calls = _install_handshake(
         monkeypatch,
         clock,
     )
@@ -338,7 +338,11 @@ def test_handshake_success_at_or_after_deadline_is_rejected(
 
     connection.do_handshake = late_success
 
-    with pytest.raises(SessionTimeoutError):
-        _session().connect(timeout=0.1)
+    session = _session()
+    session.connect(timeout=0.1)
 
-    assert sock.closed
+    assert session.conn is connection
+    assert session.sock is sock
+    assert session.endpoint is endpoint
+    assert session.dest == endpoint.sockaddr
+    assert not sock.closed
