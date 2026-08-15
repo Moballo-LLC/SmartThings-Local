@@ -48,6 +48,15 @@ sess.subscribe(["operational", "state", "vs", "0"],          # OBSERVE
 sess.close()
 ```
 
+`connect()` uses a 12-second monotonic DTLS handshake deadline by default. A
+caller that needs a shorter bounded attempt can pass a positive finite value
+without changing later reader timeouts. OpenSSL's DTLS timer schedules flight
+retransmissions within that same deadline:
+
+```python
+sess.connect(timeout=4.0)
+```
+
 If the cert/key are minted at runtime and never written to disk (e.g. inside
 an HA config flow), create the provider from memory instead:
 

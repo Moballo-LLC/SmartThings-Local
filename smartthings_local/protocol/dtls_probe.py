@@ -39,8 +39,9 @@ from dataclasses import dataclass
 from OpenSSL import SSL
 
 from ..errors import ProbeError
+from .auth import _DTLS_CIPHERS, _OCF_ROOT_CA, _load_pem_chain
 from .coap import split_dtls
-from .dtls_session import _DTLS_CIPHERS, _OCF_ROOT_CA, _load_pem_chain
+from .dtls_handshake import _drive_dtls_handshake
 from .endpoint import open_connected_udp_socket
 
 # DTLS record content types (RFC 6347 §4.1)
@@ -603,73 +604,40 @@ def diagnose_dtls_handshake(
     started = time.monotonic()
     deadline = started + timeout
     seen = set()
-    retransmits = 0
+
+    def record_datagram(datagram):
+        if result.rtt_s is None:
+            result.rtt_s = time.monotonic() - started
+        result.datagrams.append(datagram)
+        for content_type, detail in classify_datagram(datagram):
+            if content_type == _CT_HANDSHAKE:
+                if detail not in seen:
+                    seen.add(detail)
+                    result.handshake_msgs.append(detail)
+                if result.outcome == DEAD:
+                    result.outcome = LIVE
+            elif content_type == _CT_ALERT and detail is not None:
+                level, name = detail
+                result.alert = (level, name)
+                if level == 2:  # fatal
+                    result.outcome = REJECTED
+
     try:
-        while time.monotonic() < deadline:
-            try:
-                conn.do_handshake()
-                result.outcome = COMPLETED
-                if result.rtt_s is None:
-                    result.rtt_s = time.monotonic() - started
-                break
-            except SSL.WantReadError:
-                pass
-            except SSL.Error:
-                # A fatal Alert lands here; the alert record was already
-                # captured below, so classification still works.
-                result.error = ProbeError()
-                break
-
-            try:
-                o = conn.bio_read(65535)
-                if o:
-                    for r in split_dtls(o):
-                        if sock.send(r) != len(r):
-                            raise OSError('short UDP send')
-            except SSL.WantReadError:
-                pass
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            sock.settimeout(min(0.5, remaining))
-            try:
-                d = sock.recv(65535)
-            except TimeoutError:
-                # No answer to the last flight. Service OpenSSL's DTLS
-                # retransmit timer: once it has counted down to 0,
-                # handle_timeout() re-queues the previous flight into the
-                # write BIO for the next iteration to flush. A live server
-                # answers within a flight or two; a silent/non-DTLS port
-                # never does, so we give up only after `retries`
-                # retransmits — one dropped ClientHello no longer reads as
-                # a false DEAD.
-                to = conn.DTLSv1_get_timeout()
-                if to is not None and to <= 0:
-                    if retransmits >= retries:
-                        break
-                    conn.DTLSv1_handle_timeout()
-                    retransmits += 1
-                continue
-            if not d:
-                continue
-
+        completed = _drive_dtls_handshake(
+            conn,
+            sock,
+            deadline=deadline,
+            retries=retries,
+            on_datagram=record_datagram,
+        )
+        if completed:
+            result.outcome = COMPLETED
             if result.rtt_s is None:
                 result.rtt_s = time.monotonic() - started
-            result.datagrams.append(d)
-            for ct, detail in classify_datagram(d):
-                if ct == _CT_HANDSHAKE:
-                    if detail not in seen:
-                        seen.add(detail)
-                        result.handshake_msgs.append(detail)
-                    if result.outcome == DEAD:
-                        result.outcome = LIVE
-                elif ct == _CT_ALERT and detail is not None:
-                    level, name = detail
-                    result.alert = (level, name)
-                    if level == 2:  # fatal
-                        result.outcome = REJECTED
-            conn.bio_write(d)
+    except SSL.Error:
+        # A fatal Alert lands here; record_datagram() has already classified
+        # the alert record before it is fed back into OpenSSL.
+        result.error = ProbeError()
     except OSError:
         result.error = ProbeError()
     finally:

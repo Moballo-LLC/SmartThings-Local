@@ -19,6 +19,7 @@ on a per-token Event the reader signals. OBSERVE notifications are
 delivered via the on_notification callback.
 """
 import errno
+import math
 import os
 import socket
 import threading
@@ -48,6 +49,7 @@ from .auth import (
     _OCF_ROOT_CA,
     _load_pem_chain,
 )
+from .dtls_handshake import _HANDSHAKE_POLL_S, _drive_dtls_handshake
 from .endpoint import open_connected_udp_socket
 import logging
 
@@ -87,6 +89,20 @@ _ADVISORY_ERRNOS = frozenset(
                      'EHOSTDOWN', 'ENETDOWN')
     ) if value is not None
 )
+
+def _validate_handshake_timeout(timeout, default):
+    """Return one finite, positive DTLS handshake timeout."""
+    value = default if timeout is None else timeout
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError('timeout must be a number or None')
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValueError(
+            'timeout must be a positive finite number or None') from None
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError('timeout must be a positive finite number or None')
+    return value
 
 class DtlsCoapSession:
     """Single sustained DTLS-CoAP session.
@@ -199,9 +215,16 @@ class DtlsCoapSession:
 
     # ---- lifecycle ---------------------------------------------------
 
-    def connect(self):
-        """DTLS handshake. Blocks up to HANDSHAKE_TIMEOUT_S. Raises
-        ConnectionError / TimeoutError on failure."""
+    def connect(self, *, timeout: float | None = None):
+        """Perform a DTLS handshake within a monotonic deadline.
+
+        ``timeout`` overrides ``HANDSHAKE_TIMEOUT_S`` for this call. OpenSSL
+        owns DTLS retransmission timing while every receive is capped by the
+        remaining budget, so wall-clock adjustments cannot change the bound.
+        """
+        handshake_timeout = _validate_handshake_timeout(
+            timeout, self.HANDSHAKE_TIMEOUT_S)
+        deadline = time.monotonic() + handshake_timeout
         ctx = SSL.Context(SSL.DTLS_METHOD)
         self.auth.configure_context(ctx)
 
@@ -209,59 +232,39 @@ class DtlsCoapSession:
         conn.set_connect_state()
         conn.set_ciphertext_mtu(self.mtu)
 
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SessionTimeoutError()
         sock, endpoint = open_connected_udp_socket(
             self.host,
             self.port,
             family=self.family,
             local_port=self.local_port,
-            timeout=2.0,
+            timeout=min(_HANDSHAKE_POLL_S, remaining),
         )
         dest = endpoint.sockaddr
 
-        t0 = time.time()
         backend_failed = False
-        while time.time() - t0 < self.HANDSHAKE_TIMEOUT_S:
-            try:
-                conn.do_handshake()
-                break
-            except SSL.WantReadError:
-                pass
-            except SSL.Error:
-                sock.close()
-                backend_failed = True
-                break
-            send_failed = False
-            try:
-                o = conn.bio_read(65535)
-                if o:
-                    for r in _split_dtls(o):
-                        if sock.send(r) != len(r):
-                            raise OSError('incomplete UDP send')
-            except SSL.WantReadError:
-                pass
-            except OSError:
-                sock.close()
-                send_failed = True
-            if send_failed:
-                raise EndpointError() from OSError('UDP send failed')
-            receive_failed = False
-            try:
-                d = sock.recv(65535)
-                if d:
-                    conn.bio_write(d)
-            except socket.timeout:
-                pass
-            except OSError:
-                sock.close()
-                receive_failed = True
-            if receive_failed:
-                raise EndpointError() from OSError('UDP receive failed')
-            time.sleep(0.05)
-        else:
+        io_failed = False
+        try:
+            completed = _drive_dtls_handshake(
+                conn,
+                sock,
+                deadline=deadline,
+            )
+        except SSL.Error:
+            backend_failed = True
+        except OSError:
+            io_failed = True
+        if backend_failed:
+            sock.close()
+            raise SessionError() from ConnectionError('DTLS backend failed')
+        if io_failed:
+            sock.close()
+            raise EndpointError() from OSError('UDP handshake I/O failed')
+        if not completed:
             sock.close()
             raise SessionTimeoutError()
-        if backend_failed:
-            raise SessionError() from ConnectionError('DTLS backend failed')
 
         self.sock = sock
         self.conn = conn

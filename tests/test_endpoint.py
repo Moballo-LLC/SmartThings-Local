@@ -376,7 +376,7 @@ def test_session_uses_connected_socket_send_and_recv(monkeypatch):
     assert open_calls == [(('device.example', 5684), {
         'family': socket.AF_INET6,
         'local_port': None,
-        'timeout': 2.0,
+        'timeout': 0.5,
     })]
 
     session.close()
