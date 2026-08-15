@@ -171,6 +171,32 @@ the key must be exactly 16 or 32 bytes. `PskAuth` selects only
 or persist credentials. Ownership transfer and credential discovery are
 outside this package.
 
+Code that has already completed an authenticated manufacturer-certificate
+session can derive IoTivity's 128-bit OwnerPSK from the resulting TLS state:
+
+```python
+from smartthings_local.protocol.owner_psk import derive_mfg_certificate_owner_psk
+
+owner_psk = derive_mfg_certificate_owner_psk(
+    master_secret=master_secret,
+    client_random=client_random,
+    server_random=server_random,
+    owner_uuid=owner_uuid,
+    device_uuid=device_uuid,
+    cipher_name=cipher_name,
+    oxm_label=selected_oxm_label,
+)
+```
+
+The caller must supply the exact authenticated TLS values, non-nil raw OCF
+UUIDs, negotiated cipher name, and label for the selected OXM. Use
+`STANDARD_MFG_CERTIFICATE_OXM_LABEL` for `oic.sec.doxm.mfgcert` and
+`CONFIRMED_MFG_CERTIFICATE_OXM_LABEL` for
+`x.org.iotivity.conmfgcert`; do not infer the label from the appliance model.
+The helper performs deterministic key derivation only: it does not access a
+session, discover credentials, choose an ownership method, write security
+resources, run OTM, or persist the result.
+
 ### Classified errors
 
 Runtime transport failures use the public types in
@@ -605,6 +631,7 @@ smartthings_local/                   The installable library — `pip install sm
     dtls_session.py                  DTLS session: handshake, client-cert auth (file or in-memory PEM), Block2, liveness
     dtls_probe.py                    Stateless DTLS liveness + opt-in stateful diagnostic
     dtls_handshake.py                Shared memory-BIO handshake driver, bounded by a monotonic deadline (used by session + probe)
+    owner_psk.py                     Pure manufacturer-certificate OwnerPSK derivation
     ocf_root_ca.pem                  Samsung OCF root CA, bundled for handshake verification
   ocf/                               OCF resource + state layer (reusable)
     __init__.py
@@ -631,7 +658,7 @@ mqtt_demo/                           MQTT bridge demo (consumes smartthings_loca
   .env.example                       Template — copy to .env, fill in
 setup_cert.py                        One-shot cert minting script (live-fetches AC14K_M + UUID)
 pyproject.toml                       Packaging — PyPI dist `smartthings-local`, hatch-vcs versioning
-tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading, DTLS probe, bridge port resolution, cert signing, certificate profiles, connect deadline, session interruption)
+tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading, DTLS probe, bridge port resolution, cert signing, certificate profiles, OwnerPSK derivation, connect deadline, session interruption)
 .github/workflows/publish.yml        Build + PyPI Trusted Publishing on `v*` tags
 ```
 
