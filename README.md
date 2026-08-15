@@ -250,7 +250,7 @@ For a full worked integration, the higher-level `smartthings_local.ocf` layer (`
 
 Each appliance runs an independent bridge built around three coordinated pieces over one persistent DTLS session: a `StateCache` (single source of truth for all reps), a `PollScheduler` (tiered adaptive polling: hot/warm/cold plus a periodic `/device/0` sweep), and a `KeepaliveTask` (CoAP empty-CON ping for DTLS-layer liveness, with consecutive-failure detection for MQTT availability). Tier cadences are descriptor-declared and were calibrated against the empirically-measured per-firmware ceilings: dryer ~14 req/s, oven ~8 req/s. OBSERVE registrations (RFC 7641) are kept as an opportunistic freshness accelerator: when the appliance has internet and emits notifications, the cache absorbs them and the next-poll timer is reset for that resource; when it's air-gapped, polling alone carries the UX with no other code change. Token-stable Block2 (RFC 7959) handles multi-block reads. Writes are optimistically merged into the cache the moment the device 2.04-confirms, with the scheduler deferring that resource's next poll past the fetchback-revert window. Reconnect with exponential backoff on session errors, gated by a stateless DTLS ClientHello pre-flight (`smartthings_local/protocol/dtls_probe.py`) so a silent/rebooting device or wrong port drops into backoff in ~1 RTT instead of eating the full handshake timeout; when `OCF_PORT` is unset the same probe auto-discovers the live port across the OCF band.
 
-On the currently supported firmware families, authentication uses a client cert keyed to the UUID published in Samsung's own wildcard cloud TLS cert. Their factory ACL grants that UUID `perm=31` (full CRUDN) on `href=*`. That certificate path is not universal: the WD53 profile in issue #16 and the washer in issue #20 reject it and need separate authentication work.
+On the currently supported firmware families, authentication uses a client cert keyed to the UUID published in Samsung's own wildcard cloud TLS cert. Their factory ACL grants that UUID `perm=31` (full CRUDN) on `href=*`. That certificate path is not universal: the WD53 profile in issue #16 and the washer in issue #20 reject it. For those newer OCF-PKI devices, the `SamsungServerProfile` and `ServerCertificateAuth` providers (see Quick start) pin and verify the device's hardware certificate, but getting an authorized client credential to reach protected resources is still an open problem.
 
 ---
 
@@ -265,7 +265,7 @@ nmap -Pn -sU -p 5683,5684,49152-49160 "$APPLIANCE_IP"
 
 Read the result:
 
-- **`5684/udp` or a 4915x port with a DTLS first-flight response** → an OCF DTLS listener. Standard-port OCF-PKI firmware may still require an unsupported authentication profile.
+- **`5684/udp` or a 4915x port with a DTLS first-flight response** → an OCF DTLS listener. Standard-port OCF-PKI firmware needs the Samsung server-certificate profile (`SamsungServerProfile` / `ServerCertificateAuth`, see Quick start), and no working client credential for it exists yet.
 - **`5683/udp` responds to public OCF security/resource GETs** → use `/oic/res` to learn the device's advertised secure endpoint; do not assume that endpoint is fixed.
 - **Only `8888/tcp` open (token-based HTTPS)** → older firmware (~2018–2022). **Not supported here.**
 
@@ -604,6 +604,7 @@ smartthings_local/                   The installable library — `pip install sm
     coap.py                          CoAP wire protocol: message encode/decode, token handling
     dtls_session.py                  DTLS session: handshake, client-cert auth (file or in-memory PEM), Block2, liveness
     dtls_probe.py                    Stateless DTLS liveness + opt-in stateful diagnostic
+    dtls_handshake.py                Shared memory-BIO handshake driver, bounded by a monotonic deadline (used by session + probe)
     ocf_root_ca.pem                  Samsung OCF root CA, bundled for handshake verification
   ocf/                               OCF resource + state layer (reusable)
     __init__.py
@@ -630,7 +631,7 @@ mqtt_demo/                           MQTT bridge demo (consumes smartthings_loca
   .env.example                       Template — copy to .env, fill in
 setup_cert.py                        One-shot cert minting script (live-fetches AC14K_M + UUID)
 pyproject.toml                       Packaging — PyPI dist `smartthings-local`, hatch-vcs versioning
-tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading, DTLS probe, bridge port resolution, cert signing)
+tests/                               pytest suite (CoAP wire, state cache, import isolation, cert loading, DTLS probe, bridge port resolution, cert signing, certificate profiles, connect deadline, session interruption)
 .github/workflows/publish.yml        Build + PyPI Trusted Publishing on `v*` tags
 ```
 
