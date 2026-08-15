@@ -19,6 +19,7 @@ def test_smartthings_local_imports_without_mqtt_demo_present(tmp_path):
         "import smartthings_local.protocol.coap",
         "import smartthings_local.protocol.ocf_multicast",
         "import smartthings_local.protocol.dtls_session",
+        "import smartthings_local.protocol.ocf_discovery",
         "import smartthings_local.ocf.state_cache",
         "import smartthings_local.ocf.poll_scheduler",
         "import smartthings_local.ocf.keepalive",
@@ -34,6 +35,7 @@ def test_smartthings_local_imports_without_mqtt_demo_present(tmp_path):
         cwd=str(tmp_path),
         env=env,
         capture_output=True, text=True,
+        check=False,
     )
     assert result.returncode == 0, (
         f"smartthings_local failed to import without mqtt_demo/ present:\n"
