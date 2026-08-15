@@ -13,6 +13,7 @@ from ..errors import MalformedMessageError
 URI_PATH       = 11
 URI_QUERY      = 15
 OBSERVE        =  6
+ETAG           =  4
 CONTENT_FORMAT = 12
 ACCEPT         = 17
 BLOCK2         = 23
@@ -119,6 +120,14 @@ def block_value(num, more, szx):
     if v <= 0xFF:    return bytes([v])
     if v <= 0xFFFF:  return struct.pack('>H', v)
     return struct.pack('>I', v)[1:]
+
+
+def block_fields(value):
+    """Decode a CoAP Block-N option value. Inverse of block_value().
+    Returns (num, more, szx). An empty value means block 0, no more,
+    SZX=0 — RFC 7959 §2.2 allows a zero-length option to elide it."""
+    v = int.from_bytes(value, 'big')
+    return v >> 4, (v >> 3) & 1, v & 0x07
 
 
 def fmt_code(c):
