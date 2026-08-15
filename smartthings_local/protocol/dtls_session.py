@@ -12,11 +12,18 @@ Wire-level details that matter (from local-tools/oven-findings.md §17):
     or interleaved one-shot / OBSERVE traffic mis-attributes.
   * Multi-block GET requires the SAME CoAP token across every block
     of the response ("token-stable Block2"). Fresh-token-per-block
-    is silently dropped by the server.
+    is silently dropped by the server, and a transfer that opens at
+    NUM>0 under a token the server has not seen gets no reply at all.
 
 Reader thread owns the UDP socket. Callers issue get()/post() and block
 on a per-token Event the reader signals. OBSERVE notifications are
 delivered via the on_notification callback.
+
+A notification carries only the first block of a large representation
+(RFC 7959 §2.6). Because a continuation cannot borrow the observation's
+token (§3.4) and this server will not continue a transfer it did not
+start, such a notification is withheld and the resource is re-read from
+block 0 on a fresh one-shot token by a worker thread. See #39.
 """
 import errno
 import math
@@ -35,11 +42,12 @@ from ..errors import (
     SessionTimeoutError,
 )
 from .coap import (
-    URI_PATH, URI_QUERY, OBSERVE, CONTENT_FORMAT, ACCEPT, BLOCK2, SIZE2,
+    URI_PATH, URI_QUERY, OBSERVE, ETAG, CONTENT_FORMAT, ACCEPT, BLOCK2, SIZE2,
     TYPE_CON, TYPE_NON, TYPE_ACK, TYPE_RST,
     METHOD_GET, METHOD_POST, CF_CBOR,
     OBSERVE_REGISTER, OBSERVE_DEREGISTER, BLOCK_SZX,
-    encode_options, parse_coap, build_coap, block_value, fmt_code,
+    encode_options, parse_coap, build_coap, block_value, block_fields,
+    fmt_code,
     split_dtls as _split_dtls,
 )
 from .auth import (
@@ -72,12 +80,33 @@ DEBUG_BRIDGE = os.environ.get('DEBUG_BRIDGE') == '1'
 _BLOCK_MAX_ATTEMPTS = 3
 _BLOCK_ACK_TIMEOUT  = 4.0
 
+# How often a block wait re-checks that the reader is still alive. Short
+# enough that a mid-transfer reader death fails fast instead of burning
+# the whole per-block timeout, long enough to stay off the CPU.
+_BLOCK_LIVENESS_POLL_S = 0.25
+
 # Inter-request pacing: minimum seconds between CoAP CON sends on one session.
 # Samsung's RT-OCF stacks drop requests when hit faster than their firmware
 # ceiling (dryer ~14 req/s, oven ~8 req/s, dishwasher unknown). 5 req/s
 # (200 ms) is conservative enough for all tested devices; tune per device
 # once the ceiling is measured empirically.
 _DEFAULT_RATE_LIMIT_RPS = 5.0
+
+# Maximum hrefs held for OBSERVE refetch at once. A notification storm
+# on more resources than this is already past what the 5/s ceiling can
+# drain, so the excess is dropped rather than queued indefinitely.
+_MAX_PENDING_REFETCH = 16
+
+# Timeout for one notification refetch. Generous relative to a poll:
+# the resource is known large (that is why it blocked) and the worker
+# is serialized, so a slow one delays only later refetches.
+_REFETCH_TIMEOUT_S = 15.0
+
+
+class _EtagChanged(Exception):
+    """Internal: the server's ETag changed partway through a Block2
+    transfer, so the blocks in hand are from two different versions."""
+
 
 # ICMP errors a connected UDP socket surfaces on the next recv. On these
 # appliances they show up while the device is rebooting, while it holds an
@@ -241,6 +270,11 @@ class DtlsCoapSession:
         self.endpoint = None
 
         self._send_lock = threading.Lock()
+        # Guards the MID/token counters and _pending. The refetch worker
+        # makes the session its own second concurrent get() caller, so
+        # two threads can mint tokens at once; without this they can
+        # collide and one transfer silently absorbs the other's blocks.
+        self._state_lock = threading.Lock()
         # Randomize MID and token counter starting points so reconnects
         # don't reuse identifiers from previous sessions — Samsung's
         # RT-OCF appears to remember observer state across DTLS
@@ -256,6 +290,14 @@ class DtlsCoapSession:
         self._pending = {}
         # token (bytes) → href (str)
         self._observe_tokens = {}
+
+        # OBSERVE refetch queue: href → sequence number of the newest
+        # notification that asked for it. Drained by a worker thread
+        # because _dispatch_coap cannot block (see _queue_refetch).
+        self._refetch_cond = threading.Condition()
+        self._refetch_pending = {}
+        self._refetch_seq = 0
+        self._refetch_thread = None
 
         self._stop = threading.Event()
         self._reader_thread = None
@@ -407,6 +449,8 @@ class DtlsCoapSession:
         """Block until the reader thread exits (i.e. socket dies)."""
         if self._reader_thread is not None:
             self._reader_thread.join()
+        if self._refetch_thread is not None:
+            self._refetch_thread.join()
 
     def _send_observe_dereg(self, tok, path_segs):
         """Send a single OBSERVE deregister GET (Observe option = 1)
@@ -438,6 +482,11 @@ class DtlsCoapSession:
             time.sleep(0.1)
 
         self._stop.set()
+        # Wake the refetch worker so it sees _stop instead of sitting on
+        # its condition for up to a second after the socket is gone.
+        with self._refetch_cond:
+            self._refetch_pending.clear()
+            self._refetch_cond.notify_all()
         if self.conn is not None:
             try:
                 self.conn.shutdown()
@@ -448,10 +497,12 @@ class DtlsCoapSession:
                 self.sock.close()
             except Exception:
                 pass
-        for tok, (ev, container) in list(self._pending.items()):
+        with self._state_lock:
+            pending = list(self._pending.items())
+            self._pending.clear()
+        for tok, (ev, container) in pending:
             container.setdefault('err', SessionClosedError())
             ev.set()
-        self._pending.clear()
         self._observe_tokens.clear()
         self.sock = None
         self.conn = None
@@ -461,27 +512,30 @@ class DtlsCoapSession:
     # ---- send / receive plumbing -------------------------------------
 
     def _next_mid(self):
-        self._mid = (self._mid + 1) & 0xFFFF
-        return self._mid
+        with self._state_lock:
+            self._mid = (self._mid + 1) & 0xFFFF
+            return self._mid
 
     def _next_tok(self):
-        self._tok_counter = (self._tok_counter + 1) & 0xFFFFFFFF
-        # 4-byte tokens — fits within tkl=8 cap with headroom and
-        # avoids collisions across long-running OBSERVE subscriptions.
-        return self._tok_counter.to_bytes(4, 'big')
+        with self._state_lock:
+            self._tok_counter = (self._tok_counter + 1) & 0xFFFFFFFF
+            # 4-byte tokens — fits within tkl=8 cap with headroom and
+            # avoids collisions across long-running OBSERVE subscriptions.
+            return self._tok_counter.to_bytes(4, 'big')
 
     def _next_observe_tok(self):
-        # Single-byte tokens for OBSERVE registrations. Samsung
-        # RT-OCF accepts these but silently drops TKL=4 OBSERVE
-        # registrations. Counter is randomly seeded per session so
-        # reconnects don't collide with stale observer state Samsung
-        # may still be holding from the previous run.
-        self._observe_tok_counter = (self._observe_tok_counter + 1) & 0xFF
-        # Avoid 0x00 — some CoAP stacks treat an all-zero token as
-        # equivalent to "no token" / empty (TKL=0).
-        if self._observe_tok_counter == 0:
-            self._observe_tok_counter = 1
-        return bytes([self._observe_tok_counter])
+        with self._state_lock:
+            # Single-byte tokens for OBSERVE registrations. Samsung
+            # RT-OCF accepts these but silently drops TKL=4 OBSERVE
+            # registrations. Counter is randomly seeded per session so
+            # reconnects don't collide with stale observer state Samsung
+            # may still be holding from the previous run.
+            self._observe_tok_counter = (self._observe_tok_counter + 1) & 0xFF
+            # Avoid 0x00 — some CoAP stacks treat an all-zero token as
+            # equivalent to "no token" / empty (TKL=0).
+            if self._observe_tok_counter == 0:
+                self._observe_tok_counter = 1
+            return bytes([self._observe_tok_counter])
 
     def _send_dgram(self, datagram):
         """Send a CoAP datagram. Holds the send lock for the
@@ -583,9 +637,15 @@ class DtlsCoapSession:
             # Reader no longer owns the socket — callers must fail fast.
             self._reader_running.clear()
             # Make sure pending waiters don't hang if the reader dies.
-            for tok, (ev, container) in list(self._pending.items()):
+            with self._state_lock:
+                pending = list(self._pending.items())
+            for tok, (ev, container) in pending:
                 container.setdefault('err', SessionClosedError())
                 ev.set()
+            # Nothing will answer a refetch now either.
+            with self._refetch_cond:
+                self._refetch_pending.clear()
+                self._refetch_cond.notify_all()
 
     def _dispatch_coap(self, datagram):
         try:
@@ -615,7 +675,8 @@ class DtlsCoapSession:
             return
 
         # Pending one-shot? Resolve and return.
-        rec = self._pending.get(tok)
+        with self._state_lock:
+            rec = self._pending.get(tok)
         if rec is not None:
             ev, container = rec
             container['code']    = code
@@ -633,6 +694,16 @@ class DtlsCoapSession:
                 logger.warning("observe %s: non-2.05 %s",
                                href, fmt_code(code))
                 return
+            # RFC 7959 §2.6: a notification carries only the first block
+            # of the representation. Handing the callback a partial CBOR
+            # buffer is what #39 was about, so anything with M=1 (or a
+            # block past the first) goes to the refetch worker instead.
+            b2 = [v for n, v in ropts if n == BLOCK2]
+            if b2:
+                num, more, _ = block_fields(b2[0])
+                if more or num:
+                    self._queue_refetch(href)
+                    return
             cb = self.on_notification
             if cb is not None:
                 try:
@@ -644,6 +715,95 @@ class DtlsCoapSession:
 
         # Stale token (post-reconnect or unknown) — drop quietly.
 
+    # ---- OBSERVE refetch ---------------------------------------------
+
+    def _queue_refetch(self, href):
+        """Queue a blockwise notification for re-reading.
+
+        Called from the reader thread, so it must not block: _dispatch_coap
+        runs there and _blockwise_get waits on an Event only that same
+        thread can set, which would deadlock the session outright. Latest
+        wins per href — a burst of notifications on one resource collapses
+        into a single re-read of its final state."""
+        with self._refetch_cond:
+            if (href not in self._refetch_pending
+                    and len(self._refetch_pending) >= _MAX_PENDING_REFETCH):
+                logger.debug("observe %s: refetch queue full, dropping", href)
+                return
+            self._refetch_seq += 1
+            self._refetch_pending[href] = self._refetch_seq
+            self._refetch_cond.notify()
+        self._start_refetch_worker()
+
+    def _start_refetch_worker(self):
+        """Start the refetch worker on first use. Sessions that never see
+        a blockwise notification never grow the thread."""
+        if self._refetch_thread is not None or self._stop.is_set():
+            return
+        with self._state_lock:
+            if self._refetch_thread is not None or self._stop.is_set():
+                return
+            self._refetch_thread = threading.Thread(
+                target=self._refetch_loop, daemon=True,
+                name=f'stl-refetch-{self.host}')
+            self._refetch_thread.start()
+
+    def _refetch_loop(self):
+        """Re-read blockwise-notified resources, one at a time.
+
+        Serialized on purpose. Each re-read is a multi-block transfer and
+        _blockwise_get paces between blocks, so running one at a time is
+        what keeps a notification storm under the firmware's request
+        ceiling."""
+        while self._refetch_alive():
+            with self._refetch_cond:
+                while not self._refetch_pending and self._refetch_alive():
+                    self._refetch_cond.wait(1.0)
+                if not self._refetch_pending:
+                    return
+                href, seq = next(iter(self._refetch_pending.items()))
+                del self._refetch_pending[href]
+            self._refetch_one(href, seq)
+
+    def _refetch_alive(self):
+        """False once the session is closing or the reader has died. A
+        refetch needs the reader to resolve its token, so outliving it
+        would leave join() waiting on a thread with nothing to do."""
+        if self._stop.is_set():
+            return False
+        return self._reader_thread is None or self._reader_running.is_set()
+
+    def _refetch_one(self, href, seq):
+        """Re-read one href from block 0 and deliver it if it is still
+        the freshest thing we know about that resource."""
+        self.pace()
+        segs = [s for s in href.split('/') if s]
+        try:
+            code, payload = self._blockwise_get(
+                segs, (), _REFETCH_TIMEOUT_S)
+        except Exception as e:
+            # Device silent, session gone, ETag never settled, block cap
+            # hit. Whatever the reason, dropping the notification is the
+            # contract: the poll tiers still carry freshness, and handing
+            # over the first block is the bug this replaced.
+            logger.debug("observe %s: refetch failed (%s)", href, e)
+            return
+        if code != 0x45:
+            logger.debug("observe %s: refetch returned %s",
+                         href, fmt_code(code))
+            return
+        with self._refetch_cond:
+            # A newer notification landed while we were reading. That one
+            # has its own refetch queued, so this result is already stale.
+            if self._refetch_pending.get(href, 0) > seq:
+                return
+        cb = self.on_notification
+        if cb is not None:
+            try:
+                cb(href, payload)
+            except Exception as e:
+                logger.warning("notification callback %s: %s", href, e)
+
     # ---- request primitives ------------------------------------------
 
     def get(self, path_segs, query=(), timeout=10.0):
@@ -654,49 +814,51 @@ class DtlsCoapSession:
         token, and dropping a fresh token on block 1+ silently drops
         the request."""
         self._check_live()
+        return self._blockwise_get(path_segs, query, timeout)
+
+    def _blockwise_get(self, path_segs, query=(), timeout=10.0):
+        """Shared token-stable Block2 reassembly (RFC 7959 §2.4).
+
+        Mints one fresh 4-byte token and holds it across every block of
+        the transfer. Also the notification-refetch primitive: RFC 7959
+        §3.4 forbids continuing a blockwise notification on the
+        observation's token, and Samsung's RT-OCF drops a transfer that
+        opens at NUM>0 under a token it has not seen, so a truncated
+        notification is recovered by re-reading from block 0 through
+        this same path rather than by a §2.6 continuation.
+
+        Restarts once if the server's ETag changes mid-transfer, then
+        gives up: RFC 7959 §2.4 requires the client to compare ETags
+        when the server supplies them. None of the tested appliances
+        emit option 4, so on those this is inert."""
+        try:
+            return self._blockwise_get_once(path_segs, query, timeout)
+        except _EtagChanged:
+            logger.debug("GET %s /%s: ETag changed mid-transfer, restarting",
+                         self.host, '/'.join(path_segs))
+        try:
+            return self._blockwise_get_once(path_segs, query, timeout)
+        except _EtagChanged:
+            logger.debug(
+                "GET %s /%s: representation kept changing mid-transfer",
+                self.host, '/'.join(path_segs))
+            raise BlockwiseError() from None
+
+    def _blockwise_get_once(self, path_segs, query, timeout):
+        """One attempt at a full Block2 transfer. Raises _EtagChanged if
+        the server's representation changed while we were reassembling."""
         tok = self._next_tok()
         blob = b''
         num = 0
         last_code = None
-        last_opts = []
+        etag = None
         deadline = time.time() + timeout
         szx = BLOCK_SZX   # server may negotiate down; track per-transfer
         while True:
             if num > 0:
                 self.pace()
-            container = {}
-            for attempt in range(_BLOCK_MAX_ATTEMPTS):
-                ev = threading.Event()
-                container = {}
-                self._pending[tok] = (ev, container)
-                try:
-                    mid = self._next_mid()
-                    opts = [(URI_PATH, s.encode()) for s in path_segs]
-                    for q in query:
-                        opts.append((URI_QUERY, q.encode()))
-                    opts.append((ACCEPT, CF_CBOR))
-                    if num > 0:
-                        opts.append((BLOCK2, block_value(num, 0, szx)))
-                    self._send_dgram(
-                        build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
-                    per_wait = min(_BLOCK_ACK_TIMEOUT,
-                                   max(0.1, deadline - time.time()))
-                    if ev.wait(per_wait):
-                        break  # got a response
-                    remaining = deadline - time.time()
-                    if remaining <= 0 or attempt == _BLOCK_MAX_ATTEMPTS - 1:
-                        logger.debug(
-                            "GET %s /%s block %d: timed out after %d attempt(s)",
-                            self.host, '/'.join(path_segs), num, attempt + 1,
-                        )
-                        raise SessionTimeoutError()
-                    logger.debug(
-                        "GET %s /%s block %d: attempt %d/%d timeout, retrying",
-                        self.host, '/'.join(path_segs), num,
-                        attempt + 1, _BLOCK_MAX_ATTEMPTS,
-                    )
-                finally:
-                    self._pending.pop(tok, None)
+            container = self._exchange_block(
+                tok, path_segs, query, num, szx, deadline)
             if 'err' in container:
                 raise container['err']
 
@@ -704,26 +866,124 @@ class DtlsCoapSession:
             payload = container['payload']
             ropts = container['options']
             last_code = code
-            last_opts = ropts
-            blob += payload
             # 4.xx / 5.xx responses don't carry Block2 continuation —
             # bail with whatever we got. Caller decides if 4.xx is fatal.
             if code >> 5 != 2:
                 return code, blob
+
+            # RFC 7959 §2.4: compare ETags across blocks, or we splice
+            # two versions of the resource into one buffer.
+            block_etag = next((v for n, v in ropts if n == ETAG), None)
+            if num == 0:
+                etag = block_etag
+            elif etag is not None and block_etag != etag:
+                raise _EtagChanged()
+
+            blob += payload
             b2 = [v for n, v in ropts if n == BLOCK2]
-            more = 0
-            if b2:
-                bv = int.from_bytes(b2[0], 'big')
-                more = (bv >> 3) & 1
-                server_szx = bv & 0x07
-                if server_szx != szx:
-                    szx = server_szx
+            if not b2:
+                break
+            _, more, server_szx = block_fields(b2[0])
             if not more:
                 break
-            num += 1
+            if server_szx != szx:
+                # Server negotiated the block size down. Block numbers
+                # are indices into the new size, so the next one has to
+                # come off the byte offset we have actually accumulated,
+                # not off num + 1.
+                szx = server_szx
+                num = len(blob) >> (szx + 4)
+            else:
+                num += 1
             if num > self.MAX_BLOCKS:
                 raise BlockwiseError()
         return last_code, blob
+
+    def _exchange_block(self, tok, path_segs, query, num, szx, deadline):
+        """Send one block request under `tok` and return its response
+        container, retransmitting up to _BLOCK_MAX_ATTEMPTS times.
+
+        A response whose Block2 NUM is not the one we asked for is a
+        retransmit of an earlier block, not the next one. Concatenating
+        it would corrupt the buffer, so keep waiting on the same
+        attempt budget instead."""
+        for attempt in range(_BLOCK_MAX_ATTEMPTS):
+            ev = threading.Event()
+            container = {}
+            with self._state_lock:
+                self._pending[tok] = (ev, container)
+            try:
+                mid = self._next_mid()
+                opts = [(URI_PATH, s.encode()) for s in path_segs]
+                for q in query:
+                    opts.append((URI_QUERY, q.encode()))
+                opts.append((ACCEPT, CF_CBOR))
+                if num > 0:
+                    opts.append((BLOCK2, block_value(num, 0, szx)))
+                self._send_dgram(
+                    build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+                while True:
+                    per_wait = min(_BLOCK_ACK_TIMEOUT,
+                                   max(0.1, deadline - time.time()))
+                    if not self._wait_for_block(ev, per_wait):
+                        break  # attempt timed out
+                    if 'err' in container or self._block_num_matches(
+                            container, num):
+                        return container
+                    logger.debug(
+                        "GET %s /%s block %d: stale block, still waiting",
+                        self.host, '/'.join(path_segs), num)
+                    ev.clear()
+                    container.clear()
+                    if deadline - time.time() <= 0:
+                        break
+                remaining = deadline - time.time()
+                if remaining <= 0 or attempt == _BLOCK_MAX_ATTEMPTS - 1:
+                    logger.debug(
+                        "GET %s /%s block %d: timed out after %d attempt(s)",
+                        self.host, '/'.join(path_segs), num, attempt + 1,
+                    )
+                    raise SessionTimeoutError()
+                logger.debug(
+                    "GET %s /%s block %d: attempt %d/%d timeout, retrying",
+                    self.host, '/'.join(path_segs), num,
+                    attempt + 1, _BLOCK_MAX_ATTEMPTS,
+                )
+            finally:
+                with self._state_lock:
+                    self._pending.pop(tok, None)
+        raise SessionTimeoutError()
+
+    def _wait_for_block(self, ev, per_wait):
+        """Wait for one block response, giving up early if the reader
+        dies underneath us.
+
+        Only the reader thread can resolve a token, so once it is gone
+        the wait can never succeed. Polling in slices turns what would
+        be a full per-block timeout into an immediate SessionClosedError,
+        which is the same fail-fast contract get() gets from _check_live()
+        at entry — it just has to hold for every block, not only the
+        first."""
+        deadline = time.time() + per_wait
+        while True:
+            slice_s = min(_BLOCK_LIVENESS_POLL_S, deadline - time.time())
+            if slice_s <= 0:
+                return False
+            if ev.wait(slice_s):
+                return True
+            self._check_live()
+
+    @staticmethod
+    def _block_num_matches(container, num):
+        """True if this response carries the block we asked for. A
+        response with no Block2 option is the whole representation, so
+        it only answers block 0."""
+        if container.get('code', 0) >> 5 != 2:
+            return True     # error responses end the transfer either way
+        b2 = [v for n, v in container.get('options', ()) if n == BLOCK2]
+        if not b2:
+            return num == 0
+        return block_fields(b2[0])[0] == num
 
     def post(self, path_segs, body_cbor, timeout=8.0):
         """Single-frame POST with a CBOR-encoded body. Returns
@@ -738,7 +998,8 @@ class DtlsCoapSession:
                               body_cbor)
         ev = threading.Event()
         container = {}
-        self._pending[tok] = (ev, container)
+        with self._state_lock:
+            self._pending[tok] = (ev, container)
         try:
             self._send_dgram(datagram)
             if not ev.wait(timeout):
@@ -747,7 +1008,8 @@ class DtlsCoapSession:
                 raise container['err']
             return container['code'], container['payload']
         finally:
-            self._pending.pop(tok, None)
+            with self._state_lock:
+                self._pending.pop(tok, None)
 
     def ping(self):
         """RFC 7252 §4.4 CoAP Ping — empty CON, no token, no payload.

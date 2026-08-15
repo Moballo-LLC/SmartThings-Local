@@ -2,7 +2,8 @@ import pytest
 
 from smartthings_local.errors import MalformedMessageError
 from smartthings_local.protocol.coap import (
-    build_coap, parse_coap, encode_options, block_value, fmt_code,
+    build_coap, parse_coap, encode_options, block_value, block_fields,
+    fmt_code,
     TYPE_CON, METHOD_GET, URI_PATH, ACCEPT, CF_CBOR, BLOCK2,
 )
 
@@ -41,6 +42,23 @@ def test_block_value_encodes_num_more_szx():
 def test_block_value_promotes_to_two_bytes_when_num_is_large():
     v = block_value(num=0xFFF, more=0, szx=0)
     assert len(v) == 2
+
+
+@pytest.mark.parametrize('num, more, szx', [
+    (0, 0, 0),
+    (0, 1, 6),
+    (2, 1, 6),
+    (1, 0, 4),
+    (0xFFF, 0, 0),
+    (0xFFFFF, 1, 7),
+])
+def test_block_fields_inverts_block_value(num, more, szx):
+    assert block_fields(block_value(num, more, szx)) == (num, more, szx)
+
+
+def test_block_fields_treats_empty_value_as_block_zero():
+    # RFC 7959 §2.2: a zero-length Block option means num=0, m=0, szx=0.
+    assert block_fields(b'') == (0, 0, 0)
 
 
 def test_fmt_code_formats_class_dot_detail():
