@@ -57,6 +57,22 @@ retransmissions within that same deadline:
 sess.connect(timeout=4.0)
 ```
 
+Connection attempts can also use a one-way cancellation signal. The signal is
+backed by a socketpair, so setting it wakes the network wait immediately while
+OpenSSL retains control of DTLS retransmission timing:
+
+```python
+from smartthings_local.protocol.dtls_session import ConnectCancellation
+
+cancel_connect = ConnectCancellation()
+# Another thread may call cancel_connect.set().
+sess.connect(timeout=8.0, cancel=cancel_connect)
+```
+
+Setting the signal stops subscribed connection attempts and closes their
+temporary UDP sockets. It does not alter an already established session or add
+new session lifecycle methods. Interrupted attempts raise `SessionClosedError`.
+
 If the cert/key are minted at runtime and never written to disk (e.g. inside
 an HA config flow), create the provider from memory instead:
 
