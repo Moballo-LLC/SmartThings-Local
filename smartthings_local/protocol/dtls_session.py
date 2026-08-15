@@ -717,6 +717,15 @@ class DtlsCoapSession:
 
     # ---- OBSERVE refetch ---------------------------------------------
 
+    @staticmethod
+    def _log_refetch(msg, *args):
+        """Refetch outcomes are debug-level in normal operation, which is
+        below the bridge's INFO default, so a healthy session stays quiet.
+        DEBUG_BRIDGE=1 promotes them to INFO for hardware validation:
+        that shows which token the re-read used and whether it completed,
+        without also turning on every per-block retransmit line."""
+        (logger.info if DEBUG_BRIDGE else logger.debug)(msg, *args)
+
     def _queue_refetch(self, href):
         """Queue a blockwise notification for re-reading.
 
@@ -728,7 +737,9 @@ class DtlsCoapSession:
         with self._refetch_cond:
             if (href not in self._refetch_pending
                     and len(self._refetch_pending) >= _MAX_PENDING_REFETCH):
-                logger.debug("observe %s: refetch queue full, dropping", href)
+                self._log_refetch(
+                    "refetch %s dropped: queue full (%d pending)",
+                    href, len(self._refetch_pending))
                 return
             self._refetch_seq += 1
             self._refetch_pending[href] = self._refetch_seq
@@ -779,24 +790,28 @@ class DtlsCoapSession:
         self.pace()
         segs = [s for s in href.split('/') if s]
         try:
-            code, payload = self._blockwise_get(
+            code, payload, blocks, tok = self._blockwise_get(
                 segs, (), _REFETCH_TIMEOUT_S)
         except Exception as e:
             # Device silent, session gone, ETag never settled, block cap
             # hit. Whatever the reason, dropping the notification is the
             # contract: the poll tiers still carry freshness, and handing
             # over the first block is the bug this replaced.
-            logger.debug("observe %s: refetch failed (%s)", href, e)
+            self._log_refetch("refetch %s failed: %s", href, e)
             return
         if code != 0x45:
-            logger.debug("observe %s: refetch returned %s",
-                         href, fmt_code(code))
+            self._log_refetch("refetch %s returned %s", href, fmt_code(code))
             return
         with self._refetch_cond:
             # A newer notification landed while we were reading. That one
             # has its own refetch queued, so this result is already stale.
             if self._refetch_pending.get(href, 0) > seq:
+                self._log_refetch(
+                    "refetch %s tok=%s blocks=%d bytes=%d superseded",
+                    href, tok.hex(), blocks, len(payload))
                 return
+        self._log_refetch("refetch %s tok=%s blocks=%d bytes=%d ok",
+                          href, tok.hex(), blocks, len(payload))
         cb = self.on_notification
         if cb is not None:
             try:
@@ -814,10 +829,15 @@ class DtlsCoapSession:
         token, and dropping a fresh token on block 1+ silently drops
         the request."""
         self._check_live()
-        return self._blockwise_get(path_segs, query, timeout)
+        code, blob, _blocks, _tok = self._blockwise_get(
+            path_segs, query, timeout)
+        return code, blob
 
     def _blockwise_get(self, path_segs, query=(), timeout=10.0):
         """Shared token-stable Block2 reassembly (RFC 7959 §2.4).
+
+        Returns (code, payload, block_count, token). The last two are
+        diagnostics for the refetch log; get() drops them.
 
         Mints one fresh 4-byte token and holds it across every block of
         the transfer. Also the notification-refetch primitive: RFC 7959
@@ -850,6 +870,7 @@ class DtlsCoapSession:
         tok = self._next_tok()
         blob = b''
         num = 0
+        blocks = 0
         last_code = None
         etag = None
         deadline = time.time() + timeout
@@ -861,6 +882,7 @@ class DtlsCoapSession:
                 tok, path_segs, query, num, szx, deadline)
             if 'err' in container:
                 raise container['err']
+            blocks += 1
 
             code = container['code']
             payload = container['payload']
@@ -869,7 +891,7 @@ class DtlsCoapSession:
             # 4.xx / 5.xx responses don't carry Block2 continuation —
             # bail with whatever we got. Caller decides if 4.xx is fatal.
             if code >> 5 != 2:
-                return code, blob
+                return code, blob, blocks, tok
 
             # RFC 7959 §2.4: compare ETags across blocks, or we splice
             # two versions of the resource into one buffer.
@@ -897,7 +919,7 @@ class DtlsCoapSession:
                 num += 1
             if num > self.MAX_BLOCKS:
                 raise BlockwiseError()
-        return last_code, blob
+        return last_code, blob, blocks, tok
 
     def _exchange_block(self, tok, path_segs, query, num, szx, deadline):
         """Send one block request under `tok` and return its response

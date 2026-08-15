@@ -12,6 +12,7 @@ reasons, both recorded on #39: RFC 7959 §3.4 forbids continuing on the
 observation's token, and Samsung's RT-OCF drops a transfer that opens
 at NUM>0 under a token it has not seen.
 """
+import logging
 import socket
 import threading
 import time
@@ -20,6 +21,7 @@ import pytest
 from OpenSSL import SSL
 
 from smartthings_local.errors import BlockwiseError
+from smartthings_local.protocol import dtls_session
 from smartthings_local.protocol.coap import (
     BLOCK2, ETAG, METHOD_GET, OBSERVE, TYPE_ACK, TYPE_NON,
     block_fields, block_value, build_coap, parse_coap,
@@ -27,6 +29,7 @@ from smartthings_local.protocol.coap import (
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 SZX = 6  # 1024-byte blocks, the only size these appliances honour
+_LOGGER_NAME = "smartthings_local.protocol.dtls_session"
 
 
 class _NullAuth:
@@ -369,6 +372,42 @@ def test_refetch_worker_exits_when_the_reader_dies():
     sess._refetch_thread.join(6.0)
     assert not sess._refetch_thread.is_alive()
     sess.close()
+
+
+def test_debug_bridge_promotes_the_refetch_outcome_to_info(monkeypatch, caplog):
+    """The hardware validation for #39 reads this line to confirm which
+    token the re-read used, so it has to survive the bridge's INFO
+    default. Without DEBUG_BRIDGE it stays at debug."""
+    monkeypatch.setattr(dtls_session, "DEBUG_BRIDGE", True)
+    blocks = [b"A" * 1024, b"B" * 40]
+
+    def responder(request):
+        _mtype, _code, mid, tok, opts, _ = request
+        if any(n == OBSERVE for n, _ in opts):
+            return []
+        num, _ = _requested_block(request)
+        more = 1 if num + 1 < len(blocks) else 0
+        return [_content(tok, mid, blocks[num],
+                         block2=block_value(num, more, SZX))]
+
+    sess, calls = _make_session(responder)
+    try:
+        with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+            tok = sess.subscribe(["mode", "vs", "0"])
+            sess.conn.inject(
+                _notification(tok, blocks[0], block2=block_value(0, 1, SZX)))
+            assert _wait_for(lambda: calls)
+
+        line = next((r.getMessage() for r in caplog.records
+                     if r.getMessage().startswith("refetch /mode/vs/0")), None)
+        assert line is not None, "no refetch line at INFO"
+        assert "blocks=2" in line
+        assert f"bytes={sum(len(b) for b in blocks)}" in line
+        assert line.endswith("ok")
+        # The token in the line is the one-shot token, not the observe one.
+        assert f"tok={tok.hex()} " not in line
+    finally:
+        _close(sess)
 
 
 # --------------------------------------------------------------------
