@@ -220,9 +220,44 @@ def test_cancel_wakes_blocked_connect_without_poll_latency(monkeypatch):
         peer.close()
 
 
-def test_cancel_wins_race_with_reported_handshake_success(monkeypatch):
+def test_reported_handshake_success_wins_cancel_during_unsubscribe(
+    monkeypatch,
+):
+    class CancelDuringUnsubscribe(ConnectCancellation):
+        def _unsubscribe(self, reader, writer):
+            self.set()
+            return super()._unsubscribe(reader, writer)
+
+    cancel = CancelDuringUnsubscribe()
+    connection = _Connection(succeed=True)
+    data_socket, peer = socket.socketpair()
+    endpoint = _install_connection(monkeypatch, connection, data_socket)
+    session = _session()
+
+    try:
+        session.connect(cancel=cancel)
+        assert cancel.is_set()
+        assert session.sock is data_socket
+        assert session.conn is connection
+        assert session.endpoint is endpoint
+        assert session.dest == endpoint.sockaddr
+        assert not cancel._writers
+    finally:
+        session.close()
+        peer.close()
+
+
+def test_cancel_during_backend_failure_does_not_read_unset_completion(
+    monkeypatch,
+):
     cancel = ConnectCancellation()
-    connection = _Connection(on_success=cancel.set, succeed=True)
+    connection = _Connection()
+
+    def fail_after_cancel():
+        cancel.set()
+        raise SSL.Error("synthetic backend failure")
+
+    connection.do_handshake = fail_after_cancel
     data_socket, peer = socket.socketpair()
     _install_connection(monkeypatch, connection, data_socket)
     session = _session()
@@ -233,6 +268,7 @@ def test_cancel_wins_race_with_reported_handshake_success(monkeypatch):
         assert data_socket.fileno() == -1
         assert session.sock is None
         assert session.conn is None
+        assert not cancel._writers
     finally:
         peer.close()
 

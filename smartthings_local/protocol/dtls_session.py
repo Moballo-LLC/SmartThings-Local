@@ -382,6 +382,7 @@ class DtlsCoapSession:
         io_failed = False
         cancelled = False
         interrupted = False
+        completed = False
         try:
             try:
                 completed = _drive_dtls_handshake(
@@ -403,7 +404,7 @@ class DtlsCoapSession:
         finally:
             if wake_subscription is not None:
                 interrupted = cancel._unsubscribe(*wake_subscription)
-        if cancelled or interrupted:
+        if cancelled or (interrupted and not completed):
             sock.close()
             raise SessionClosedError()
         if backend_failed:
