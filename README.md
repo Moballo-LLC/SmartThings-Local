@@ -57,6 +57,10 @@ retransmissions within that same deadline:
 sess.connect(timeout=4.0)
 ```
 
+The deadline stops further setup, retries, and network waits. If OpenSSL
+reports that the handshake completed at the deadline boundary, the completed
+session is retained rather than torn down as a timeout.
+
 Connection attempts can also use a one-way cancellation signal. The signal is
 backed by a socketpair, so setting it wakes the network wait immediately while
 OpenSSL retains control of DTLS retransmission timing:

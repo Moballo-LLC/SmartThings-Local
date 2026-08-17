@@ -322,13 +322,15 @@ class DtlsCoapSession:
         timeout: float | None = None,
         cancel: ConnectCancellation | None = None,
     ):
-        """Perform a cancellable DTLS handshake within a monotonic deadline.
+        """Perform a cancellable DTLS handshake using a monotonic deadline.
 
         ``timeout`` overrides ``HANDSHAKE_TIMEOUT_S`` for this call. OpenSSL
         owns DTLS retransmission timing while every receive is capped by the
         remaining budget, so wall-clock adjustments cannot change the bound.
-        A ``ConnectCancellation`` wakes the network wait immediately and does
-        not alter an already established session.
+        Once OpenSSL reports completion, that completed session is retained
+        even if the call returns just after the deadline. A
+        ``ConnectCancellation`` wakes the network wait immediately and does not
+        alter an already established session.
         """
         handshake_timeout = _validate_handshake_timeout(
             timeout, self.HANDSHAKE_TIMEOUT_S)
