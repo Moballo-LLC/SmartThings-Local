@@ -18,6 +18,7 @@ from smartthings_local.protocol.dtls_session import (
     ConnectCancellation,
     DtlsCoapSession,
 )
+from smartthings_local.protocol.owner_psk import derive_mfg_certificate_owner_psk
 
 
 def _assert_compatible_signature(callable_object, expected: list[str]) -> None:
@@ -107,6 +108,26 @@ def test_psk_auth_is_a_public_authentication_provider():
     assert isinstance(provider, AuthenticationProvider)
     parameters = inspect.signature(PskAuth).parameters
     assert list(parameters) == ["identity", "key"]
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+        for parameter in parameters.values()
+    )
+
+
+def test_owner_psk_derivation_keeps_every_security_input_explicit():
+    parameters = inspect.signature(
+        derive_mfg_certificate_owner_psk
+    ).parameters
+    assert list(parameters) == [
+        "master_secret",
+        "client_random",
+        "server_random",
+        "owner_uuid",
+        "device_uuid",
+        "cipher_name",
+        "oxm_label",
+    ]
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
         and parameter.default is inspect.Parameter.empty
