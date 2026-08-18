@@ -80,6 +80,8 @@ def derive_mfg_certificate_owner_psk(
     It performs no session access, network I/O, ownership writes, or storage.
     The caller must supply state from an authenticated manufacturer-certificate
     session and explicitly select the OXM label used by that transaction.
+    IoTivity's other 96-byte ECDH_ANON, ECDHE_PSK, and ECDHE_RSA mappings are
+    intentionally outside this helper's manufacturer-certificate allowlist.
     """
 
     if not isinstance(cipher_name, str):
