@@ -18,6 +18,10 @@ from smartthings_local.protocol.dtls_session import (
     ConnectCancellation,
     DtlsCoapSession,
 )
+from smartthings_local.protocol.ocf_multicast import (
+    OcfResponderPortDiscoveryResult,
+    discover_ocf_responder_ports,
+)
 from smartthings_local.protocol.owner_psk import derive_mfg_certificate_owner_psk
 
 
@@ -55,6 +59,32 @@ def test_dtls_session_constructor_keeps_file_memory_and_local_port_inputs():
     auth_parameter = inspect.signature(DtlsCoapSession).parameters["auth"]
     assert auth_parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert auth_parameter.default is None
+
+
+def test_known_host_multicast_discovery_has_a_bounded_explicit_interface_api():
+    parameters = inspect.signature(discover_ocf_responder_ports).parameters
+    assert list(parameters) == [
+        "target_address",
+        "interface_address",
+        "discovery_port",
+        "timeout",
+        "rounds",
+    ]
+    assert parameters["target_address"].default is inspect.Parameter.empty
+    for name in ("interface_address", "discovery_port", "timeout", "rounds"):
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["interface_address"].default is inspect.Parameter.empty
+    assert parameters["discovery_port"].default == 5683
+    assert parameters["timeout"].default == 3.0
+    assert parameters["rounds"].default == 2
+
+    result = OcfResponderPortDiscoveryResult(
+        ports=(43123,),
+        attempts=2,
+        responses=1,
+    )
+    assert result.found is True
+    assert result.ports == (43123,)
 
 
 def test_certificate_auth_is_a_public_authentication_provider():
