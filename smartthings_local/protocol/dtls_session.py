@@ -879,8 +879,8 @@ class DtlsCoapSession:
         deadline = time.time() + timeout
         szx = BLOCK_SZX   # server may negotiate down; track per-transfer
         while True:
-            if num > 0:
-                self.pace()
+            self.pace()
+            self._check_live()
             container = self._exchange_block(
                 tok, path_segs, query, num, szx, deadline)
             if 'err' in container:
@@ -1026,6 +1026,8 @@ class DtlsCoapSession:
         with self._state_lock:
             self._pending[tok] = (ev, container)
         try:
+            self.pace()
+            self._check_live()
             self._send_dgram(datagram)
             if not ev.wait(timeout):
                 raise SessionTimeoutError()
@@ -1088,6 +1090,8 @@ class DtlsCoapSession:
 
         Returns the token used (in case the caller wants to deregister
         later)."""
+        self._check_live()
+        self.pace()
         self._check_live()
         tok = self._next_observe_tok()
         href = '/' + '/'.join(path_segs)
