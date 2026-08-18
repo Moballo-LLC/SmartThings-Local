@@ -166,7 +166,7 @@ def main():
         stopping.set()
         logger.info("shutting down…")
         for b in bridges:
-            b.stop.set()
+            b.request_stop()
             try: b.set_availability(False)
             except Exception: pass
 

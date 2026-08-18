@@ -87,6 +87,7 @@ OCF_STANDARD_SECURE_PORT = 5684
 # fixed-source-port reconnect invariant is untouched (see session_once).
 _GATE_RETRIES = 1
 _GATE_TIMEOUT_S = 4.0
+_WORKER_JOIN_TIMEOUT_S = 2.0
 
 
 class PushBridge:
@@ -123,6 +124,8 @@ class PushBridge:
         self.last_cycle_pub = None
         self.last_avail_pub: str | None = None
         self.stop = threading.Event()
+        self._session_stop_lock = threading.Lock()
+        self._session_stop: threading.Event | None = None
         self.started_ts = time.time()
         self.session_started_ts = None
         self.last_change_ts = None
@@ -174,6 +177,13 @@ class PushBridge:
             + bridge_diagnostic_discovery(
                 app.topic_prefix, shared.HA_DISCOVERY_PREFIX, app.device_name,
                 model=descriptor.name.title()))
+
+    def request_stop(self) -> None:
+        """Stop the bridge and wake workers belonging to its current session."""
+        self.stop.set()
+        with self._session_stop_lock:
+            if self._session_stop is not None:
+                self._session_stop.set()
 
     # ---- cache plumbing ---------------------------------------------
 
@@ -423,25 +433,54 @@ class PushBridge:
         self.keepalive = keepalive
         self.observe_refresh = observe_refresh
 
+        # These workers belong to this DTLS session, not to the bridge
+        # process. A reconnect must retire them before the replacement
+        # session starts or they continue operating on the closed session.
+        session_stop = threading.Event()
+        with self._session_stop_lock:
+            self._session_stop = session_stop
+            # ``request_stop()`` sets the bridge event before taking this
+            # lock. Checking it while publishing the handle prevents a lost
+            # wakeup if shutdown races this session handoff.
+            if self.stop.is_set():
+                session_stop.set()
+
         sched_t = threading.Thread(
-            target=scheduler.run_forever, args=(self.stop,),
+            target=scheduler.run_forever, args=(session_stop,),
             daemon=True, name=f'{self.app.klass}-poll')
         ka_t = threading.Thread(
-            target=keepalive.run_forever, args=(self.stop,),
+            target=keepalive.run_forever, args=(session_stop,),
             daemon=True, name=f'{self.app.klass}-ping')
         ref_t = threading.Thread(
-            target=observe_refresh.run_forever, args=(self.stop,),
+            target=observe_refresh.run_forever, args=(session_stop,),
             daemon=True, name=f'{self.app.klass}-obsref')
-        sched_t.start()
-        ka_t.start()
-        ref_t.start()
+        workers = (sched_t, ka_t, ref_t)
+        started_workers = []
 
         try:
+            for worker in workers:
+                worker.start()
+                started_workers.append(worker)
             sess.join()
         finally:
+            # A worker already inside a tick can finish after the reader
+            # exits. Disable old-session reachability callbacks first so it
+            # cannot change availability after a replacement takes over.
+            keepalive.on_reachable = None
+            keepalive.on_unreachable = None
+            session_stop.set()
+            join_deadline = time.monotonic() + _WORKER_JOIN_TIMEOUT_S
+            for worker in started_workers:
+                worker.join(max(0.0, join_deadline - time.monotonic()))
+                if worker.is_alive():
+                    self.log.warning(
+                        "session worker did not stop: %s", worker.name)
             self.scheduler = None
             self.keepalive = None
             self.observe_refresh = None
+            with self._session_stop_lock:
+                if self._session_stop is session_stop:
+                    self._session_stop = None
 
     def _seed_from_device0(self, sess):
         code, pl = sess.get(self.descriptor.seed_path, timeout=15.0)
