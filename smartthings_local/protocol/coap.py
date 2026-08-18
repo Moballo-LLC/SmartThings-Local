@@ -18,7 +18,9 @@ ETAG           =  4
 CONTENT_FORMAT = 12
 ACCEPT         = 17
 BLOCK2         = 23
+BLOCK1         = 27
 SIZE2          = 28
+SIZE1          = 60
 
 # CoAP message types
 TYPE_CON = 0
@@ -249,12 +251,13 @@ def _option_bytes(value, *, name):
 
 def build_get_request(
         mtype, mid, token, path_segs, query=(), *, accept=CF_CBOR,
-        block_number=None, block_szx=BLOCK_SZX):
-    """Build a GET with optional Uri-Query, Accept, and Block2 options.
+        block_number=None, block_szx=BLOCK_SZX, extra_options=()):
+    """Build a GET with optional query, Block2, and extension options.
 
     ``block_number=None`` omits Block2 for the initial request.  Continuation
     requests pass the accumulator's ``expected_number`` and ``szx``.  Path and
-    query values may be either text or already encoded bytes.
+    query values may be either text or already encoded bytes. Extension
+    options are expected to have been validated by the session.
     """
     options = [
         (URI_PATH, _option_bytes(segment, name='path segment'))
@@ -278,6 +281,7 @@ def build_get_request(
                 or not 0 <= block_szx <= BLOCK_SZX):
             raise ValueError('block_szx must be between 0 and 6')
         options.append((BLOCK2, block_value(block_number, 0, block_szx)))
+    options.extend(extra_options)
     return build_coap(mtype, METHOD_GET, mid, token, options)
 
 
