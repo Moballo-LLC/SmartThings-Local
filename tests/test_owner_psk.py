@@ -23,7 +23,11 @@ _VALID_INPUTS = {
 }
 
 
-def test_fixed_iotivity_gcm_vector():
+# These synthetic expected values were generated from the fixed inputs above;
+# they were not captured from IoTivity or a device. They lock deterministic
+# output for the selected mappings, while the table test below states the
+# key-block-length contract explicitly.
+def test_fixed_synthetic_gcm_regression_vector():
     assert derive_mfg_certificate_owner_psk(**_VALID_INPUTS).hex() == (
         "ccd6c618a91290dee8c106544ed79a33"
     )
@@ -42,7 +46,7 @@ def test_owner_then_device_uuid_order_matches_iotivity_callers():
     assert reversed_context != derive_mfg_certificate_owner_psk(**_VALID_INPUTS)
 
 
-def test_fixed_iotivity_ccm8_vector():
+def test_fixed_synthetic_ccm8_regression_vector():
     inputs = {
         **_VALID_INPUTS,
         "cipher_name": "ECDHE-ECDSA-AES128-CCM8",
