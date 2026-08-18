@@ -57,6 +57,7 @@ from .coap import (
     BLOCK1,
     BLOCK2,
     BLOCK2_COMPLETE,
+    BLOCK_SZX,
     CF_CBOR,
     CONTENT_FORMAT,
     ETAG,
@@ -76,6 +77,7 @@ from .coap import (
     URI_QUERY,
     Block2Accumulator,
     block_fields,
+    block_value,
     build_coap,
     build_get_request,
     classify_coap_response,
@@ -108,6 +110,8 @@ DEBUG_BRIDGE = os.environ.get('DEBUG_BRIDGE') == '1'
 # overall deadline). Matches RFC 7252 CON retransmit behaviour.
 _BLOCK_MAX_ATTEMPTS = 3
 _BLOCK_ACK_TIMEOUT  = 4.0
+_MAX_BLOCK1_BODY_BYTES = 512 * 1024
+_MAX_BLOCK1_REQUESTS = 1024
 
 # Base per-attempt wait for a write retransmission, doubled per attempt
 # (RFC 7252 §4.2). Retransmission itself is off by default: a device that
@@ -883,17 +887,22 @@ class DtlsCoapSession:
         if classification.kind != RESPONSE_MESSAGE:
             return
 
-        # Pending one-shot? Resolve and return.
+        # Pending one-shot? Resolve and return. Block1 keeps one token for the
+        # entire upload, so a delayed response for the previous chunk must not
+        # resolve the currently registered chunk.
         with self._state_lock:
             rec = self._pending.get(tok)
             if rec is not None:
                 ev, container = rec
-                container['code']    = code
-                container['mtype']   = mt
-                container['mid']     = mid
-                container['options'] = ropts
-                container['payload'] = payload
-                container['message'] = message
+                if self._block1_response_matches(message, container):
+                    container['code']    = code
+                    container['mtype']   = mt
+                    container['mid']     = mid
+                    container['options'] = ropts
+                    container['payload'] = payload
+                    container['message'] = message
+                else:
+                    rec = None
         if rec is not None:
             ev.set()
             return
@@ -1254,11 +1263,49 @@ class DtlsCoapSession:
         response_offset = response_num << (response_szx + 4)
         return response_offset == requested_offset
 
+    @staticmethod
+    def _block1_response_matches(message, container):
+        """Return whether ``message`` can answer the pending Block1 chunk.
+
+        A Block1 upload deliberately reuses its token across every chunk.
+        Samsung can deliver an acknowledgement for the previous chunk after
+        the next one is registered, so successful responses that carry Block1
+        must cover the byte range currently pending. Responses without Block1
+        are left to the caller's protocol validation: errors and a final 2.xx
+        response may legitimately omit it, while an intermediate 2.31 may not.
+        """
+        expected_start = container.get('expected_block1_start')
+        if message.code >> 5 != 2 or expected_start is None:
+            return True
+        block_values = [
+            value for number, value in message.options if number == BLOCK1]
+        if not block_values:
+            return True
+        if len(block_values) != 1 or len(block_values[0]) > 3:
+            return False
+        response_num, _response_more, response_szx = \
+            block_fields(block_values[0])
+        if response_szx > BLOCK_SZX:
+            return False
+        response_size = 1 << (response_szx + 4)
+        response_start = response_num * response_size
+        response_end = response_start + response_size
+        expected_end = container['expected_block1_end']
+        if container['expected_block1_more']:
+            return response_end == expected_end
+        return (
+            response_start <= expected_start < response_end
+            and expected_end <= response_end
+        )
+
     def post(
             self, path_segs, body_cbor, timeout=8.0, *, query=(),
             extra_options=()):
-        """Single-frame POST with a CBOR-encoded body. Returns
-        (code, payload_bytes). body_cbor must already be encoded.
+        """POST a CBOR-encoded body and return (code, payload_bytes).
+
+        Bodies through one 1024-byte OCF block retain the single-frame path.
+        Larger bodies use token-stable Block1 framing. ``body_cbor`` must
+        already be encoded.
 
         timeout bounds the whole call, pacing included, so post() returns
         within it rather than within it plus a rate-limit interval.
@@ -1277,12 +1324,23 @@ class DtlsCoapSession:
         extra_options = _validated_extra_options(extra_options)
         if not isinstance(body_cbor, bytes):
             raise TypeError('body_cbor must be bytes')
-        tok = self._next_tok()
+        if len(body_cbor) > _MAX_BLOCK1_BODY_BYTES:
+            raise ValueError('body_cbor must contain at most 524288 bytes')
+        block_size = 1 << (BLOCK_SZX + 4)
         opts = [(URI_PATH, s.encode()) for s in path_segs]
         for q in query:
             opts.append((URI_QUERY, q.encode()))
         opts.append((CONTENT_FORMAT, CF_CBOR))
         opts.append((ACCEPT, CF_CBOR))
+        if len(body_cbor) > block_size:
+            return self._post_blockwise(
+                path_segs,
+                body_cbor,
+                opts,
+                extra_options,
+                timeout=timeout,
+            )
+        tok = self._next_tok()
         opts.extend(extra_options)
         ev = threading.Event()
         container = {}
@@ -1376,6 +1434,173 @@ class DtlsCoapSession:
                 logger.debug(
                     "POST %s /%s: attempt %d/%d timeout, retransmitting",
                     self.host, '/'.join(path_segs), attempt + 1, attempts,
+                )
+            raise SessionTimeoutError()
+        finally:
+            self._unregister_pending_request(tok, mid, exchange)
+
+    def _post_blockwise(
+            self, path_segs, body_cbor, base_options, extra_options, *,
+            timeout):
+        """Upload one bounded body with token-stable Block1 framing."""
+        tok = self._next_tok()
+        deadline = time.monotonic() + timeout
+        offset = 0
+        szx = BLOCK_SZX
+        request_count = 0
+
+        while offset < len(body_cbor):
+            self._check_live()
+            block_size = 1 << (szx + 4)
+            if offset % block_size:
+                raise BlockwiseError()
+            num = offset // block_size
+            chunk = body_cbor[offset:offset + block_size]
+            end_offset = offset + len(chunk)
+            more = int(end_offset < len(body_cbor))
+            request_count += 1
+            if request_count > _MAX_BLOCK1_REQUESTS:
+                raise BlockwiseError()
+
+            opts = list(base_options)
+            opts.append((BLOCK1, block_value(num, more, szx)))
+            if offset == 0:
+                size_width = max(
+                    1, (len(body_cbor).bit_length() + 7) // 8)
+                opts.append((
+                    SIZE1,
+                    len(body_cbor).to_bytes(size_width, 'big'),
+                ))
+            opts.extend(extra_options)
+            message = self._exchange_block1(
+                tok,
+                path_segs,
+                opts,
+                chunk,
+                block_num=num,
+                start=offset,
+                end=end_offset,
+                more=more,
+                deadline=deadline,
+            )
+            code = message.code
+            payload = message.payload
+            response_blocks = [
+                value for number, value in message.options
+                if number == BLOCK1]
+
+            if more:
+                if code != 0x5F:
+                    if code >> 5 == 2:
+                        raise BlockwiseError()
+                    return code, payload
+                if len(response_blocks) > 1:
+                    raise BlockwiseError()
+                if not response_blocks or len(response_blocks[0]) > 3:
+                    raise BlockwiseError()
+                _response_num, response_more, response_szx = \
+                    block_fields(response_blocks[0])
+                if not response_more or response_szx > szx:
+                    raise BlockwiseError()
+                szx = response_szx
+                if offset % (1 << (szx + 4)):
+                    raise BlockwiseError()
+                offset = end_offset
+                continue
+
+            if code >> 5 != 2:
+                return code, payload
+            if code == 0x5F:
+                raise BlockwiseError()
+            if len(response_blocks) > 1:
+                raise BlockwiseError()
+            if response_blocks:
+                block = response_blocks[0]
+                if len(block) > 3:
+                    raise BlockwiseError()
+                _response_num, response_more, response_szx = \
+                    block_fields(block)
+                if response_more or response_szx > szx:
+                    raise BlockwiseError()
+            return code, payload
+
+        raise BlockwiseError()
+
+    def _exchange_block1(
+            self, tok, path_segs, options, payload, *, block_num, start, end,
+            more, deadline):
+        """Send one Block1 chunk under a stable token and Message ID."""
+        ev = threading.Event()
+        container = {
+            'expected_block1_start': start,
+            'expected_block1_end': end,
+            'expected_block1_more': more,
+        }
+        mid, exchange = self._register_pending_request(tok, ev, container)
+        try:
+            datagram = build_coap(
+                TYPE_CON, METHOD_POST, mid, tok, options, payload)
+            for attempt in range(_BLOCK_MAX_ATTEMPTS):
+                self.pace()
+                with self._state_lock:
+                    error = container.get('err')
+                    message = container.get('message')
+                    acknowledged = exchange.acknowledged
+                # A response may land while a retry is being paced. Honour it
+                # before checking reader liveness so a response dispatched just
+                # before teardown is not discarded or resent.
+                if error is not None:
+                    raise error
+                if message is not None:
+                    return message
+                self._check_live()
+                if time.monotonic() >= deadline:
+                    raise SessionTimeoutError()
+                if not acknowledged:
+                    try:
+                        self._send_dgram(datagram)
+                    except EndpointError:
+                        if not attempt:
+                            raise
+                        logger.debug(
+                            "POST %s /%s block %d: retransmit %d/%d "
+                            "send failed",
+                            self.host, '/'.join(path_segs), block_num,
+                            attempt + 1, _BLOCK_MAX_ATTEMPTS,
+                        )
+
+                last = attempt == _BLOCK_MAX_ATTEMPTS - 1
+                while True:
+                    with self._state_lock:
+                        error = container.get('err')
+                        message = container.get('message')
+                        if error is None and message is None:
+                            ev.clear()
+                        acknowledged = exchange.acknowledged
+                    if error is not None:
+                        raise error
+                    if message is not None:
+                        return message
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SessionTimeoutError()
+                    per_wait = (
+                        remaining if acknowledged
+                        else min(_BLOCK_ACK_TIMEOUT, remaining)
+                    )
+                    if self._wait_live(ev, per_wait):
+                        continue
+                    if acknowledged or last:
+                        raise SessionTimeoutError()
+                    break
+
+                if deadline - time.monotonic() <= self._min_req_interval:
+                    break
+                logger.debug(
+                    "POST %s /%s block %d: attempt %d/%d timeout, "
+                    "retransmitting",
+                    self.host, '/'.join(path_segs), block_num,
+                    attempt + 1, _BLOCK_MAX_ATTEMPTS,
                 )
             raise SessionTimeoutError()
         finally:
