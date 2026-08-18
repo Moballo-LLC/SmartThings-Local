@@ -60,6 +60,7 @@ from .coap import (
     CF_CBOR,
     CONTENT_FORMAT,
     ETAG,
+    METHOD_DELETE,
     METHOD_GET,
     METHOD_POST,
     OBSERVE,
@@ -1377,6 +1378,53 @@ class DtlsCoapSession:
                     self.host, '/'.join(path_segs), attempt + 1, attempts,
                 )
             raise SessionTimeoutError()
+        finally:
+            self._unregister_pending_request(tok, mid, exchange)
+
+    def delete(
+            self, path_segs, timeout=8.0, *, query=(), extra_options=()):
+        """Single-frame DELETE. Returns (code, payload_bytes).
+
+        ``timeout`` bounds the whole call, including request pacing.
+        """
+        self._check_live()
+        path_segs = _validated_text_options(
+            path_segs, name='path_segs', allow_empty=False)
+        query = _validated_text_options(
+            query, name='query', allow_empty=False)
+        extra_options = _validated_extra_options(extra_options)
+        tok = self._next_tok()
+        opts = [(URI_PATH, s.encode()) for s in path_segs]
+        for q in query:
+            opts.append((URI_QUERY, q.encode()))
+        opts.append((ACCEPT, CF_CBOR))
+        opts.extend(extra_options)
+        ev = threading.Event()
+        container = {}
+        mid, exchange = self._register_pending_request(tok, ev, container)
+        datagram = build_coap(TYPE_CON, METHOD_DELETE, mid, tok, opts)
+        deadline = time.time() + timeout
+        try:
+            self.pace()
+            self._check_live()
+            self._send_dgram(datagram)
+            while True:
+                with self._state_lock:
+                    error = container.get('err')
+                    has_response = 'code' in container
+                    response = (
+                        (container['code'], container['payload'])
+                        if has_response else None
+                    )
+                    if error is None and not has_response:
+                        ev.clear()
+                if error is not None:
+                    raise error
+                if has_response:
+                    return response
+                remaining = deadline - time.time()
+                if remaining <= 0 or not self._wait_live(ev, remaining):
+                    raise SessionTimeoutError()
         finally:
             self._unregister_pending_request(tok, mid, exchange)
 
