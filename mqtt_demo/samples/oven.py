@@ -166,6 +166,14 @@ def flatten(links):
     if temps_items:
         cur_c = _int(temps_items[0].get('x.com.samsung.da.current'))
         des_c = _int(temps_items[0].get('x.com.samsung.da.desired'))
+    # With no cycle set the oven reports desired=0. That means "no
+    # setpoint", not a 0 °C target, and HA rejects it against the Number
+    # entity's 30-270 range on every publish. Anything outside the
+    # settable band is absent, not a value: null lands as unknown on both
+    # the Number and the Setpoint sensor, the way completion_minutes
+    # already reads when idle. _setpoint applies the same bounds on write.
+    if des_c is not None and not (SETPOINT_MIN_C <= des_c <= SETPOINT_MAX_C):
+        des_c = None
 
     # Door
     doors_items = g('/doors/vs/0', 'x.com.samsung.da.items') or []
