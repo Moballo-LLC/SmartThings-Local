@@ -262,6 +262,34 @@ The resolver retains candidate order and the socket setup tries the next
 candidate after a family, bind, or connect failure. Resolution and socket
 setup failures raise the redacted `EndpointError` documented above.
 
+### Dynamic plaintext OCF response ports
+
+Some OCF devices listen for multicast discovery on UDP 5683 but send their
+response from a different port that changes after a power cycle. A caller that
+already knows the device's IPv4 address can discover those plaintext response
+port candidates on one explicit LAN interface:
+
+```python
+from smartthings_local.protocol.ocf_multicast import (
+    discover_ocf_responder_ports,
+)
+
+result = discover_ocf_responder_ports(
+    "192.0.2.20",
+    interface_address="192.0.2.10",
+)
+for discovery_port in result.ports:
+    pass  # use for a bounded, source-bound /oic/res lookup
+```
+
+The call sends unfiltered current OCF and legacy IoTivity directory requests,
+plus a legacy DOXM-filtered fallback, under one deadline. It accepts only
+token-correlated replies from the expected host, closes its multicast socket
+before returning, and omits addresses and ports from its result representation.
+Returned ports are unauthenticated candidates, not DTLS endpoints; directory
+parsing, DTLS liveness, and authenticated device identity remain separate
+checks.
+
 For a full worked integration, the higher-level `smartthings_local.ocf` layer (`StateCache`, `PollScheduler`, `KeepaliveTask`, `ObserveRefreshTask`) coordinates tiered polling and OBSERVE on top of a session. The MQTT bridge demo below wires all of it together.
 
 ### What the demo bridge gives you

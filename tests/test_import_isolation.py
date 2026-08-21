@@ -17,6 +17,7 @@ def test_smartthings_local_imports_without_mqtt_demo_present(tmp_path):
 
     import_lines = [
         "import smartthings_local.protocol.coap",
+        "import smartthings_local.protocol.ocf_multicast",
         "import smartthings_local.protocol.dtls_session",
         "import smartthings_local.ocf.state_cache",
         "import smartthings_local.ocf.poll_scheduler",
