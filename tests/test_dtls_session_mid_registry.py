@@ -10,6 +10,7 @@ from smartthings_local.errors import (
     EndpointError,
     SessionClosedError,
     SessionError,
+    SessionResetError,
     SessionTimeoutError,
 )
 from smartthings_local.protocol import dtls_session
@@ -139,7 +140,9 @@ def test_matching_bare_rst_fails_request(operation):
     with pytest.raises(SessionError) as raised:
         _request(session, operation)
 
-    assert type(raised.value) is SessionError
+    # A RST refuses one exchange while the transport stays up, so it is its
+    # own type rather than the generic session failure.
+    assert type(raised.value) is SessionResetError
     assert session._pending == {}
     assert session._pending_mids == {}
 
