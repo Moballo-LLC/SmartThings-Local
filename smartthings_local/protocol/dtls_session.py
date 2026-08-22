@@ -31,6 +31,7 @@ import os
 import socket
 import threading
 import time
+from dataclasses import dataclass
 
 from OpenSSL import SSL
 
@@ -106,6 +107,14 @@ _REFETCH_TIMEOUT_S = 15.0
 class _EtagChanged(Exception):
     """Internal: the server's ETag changed partway through a Block2
     transfer, so the blocks in hand are from two different versions."""
+
+
+@dataclass(slots=True)
+class _MidExchange:
+    """One pending request, indexed independently by token and MID."""
+
+    pending: tuple[threading.Event, dict]
+    acknowledged: bool = False
 
 
 # ICMP errors a connected UDP socket surfaces on the next recv. On these
@@ -270,10 +279,11 @@ class DtlsCoapSession:
         self.endpoint = None
 
         self._send_lock = threading.Lock()
-        # Guards the MID/token counters and _pending. The refetch worker
-        # makes the session its own second concurrent get() caller, so
-        # two threads can mint tokens at once; without this they can
-        # collide and one transfer silently absorbs the other's blocks.
+        # Guards the MID/token counters and pending-request registries.
+        # The refetch worker makes the session its own second concurrent
+        # get() caller, so two threads can mint tokens at once; without
+        # this they can collide and one transfer silently absorbs the
+        # other's blocks.
         self._state_lock = threading.Lock()
         # Randomize MID and token counter starting points so reconnects
         # don't reuse identifiers from previous sessions — Samsung's
@@ -288,6 +298,10 @@ class DtlsCoapSession:
         self._observe_tok_counter = 0x40 + (os.urandom(1)[0] & 0xBF)
         # token (bytes) → (Event, container_dict)
         self._pending = {}
+        # request MID (int) → _MidExchange. Empty ACK and RST frames carry
+        # no token, so request lifecycle state must also be reachable by the
+        # MID that was registered before send.
+        self._pending_mids = {}
         # token (bytes) → href (str)
         self._observe_tokens = {}
 
@@ -500,24 +514,68 @@ class DtlsCoapSession:
                 self.sock.close()
             except Exception:
                 pass
-        with self._state_lock:
-            pending = list(self._pending.items())
-            self._pending.clear()
-        for tok, (ev, container) in pending:
-            container.setdefault('err', SessionClosedError())
-            ev.set()
-        self._observe_tokens.clear()
+        # Publish the closed state before draining pending requests. A caller
+        # that passed its entry check just before close() will then fail the
+        # post-registration liveness check instead of registering after the
+        # drain and waiting against a session that can no longer respond.
         self.sock = None
         self.conn = None
         self.dest = None
         self.endpoint = None
+        self._close_pending_requests()
+        self._observe_tokens.clear()
 
     # ---- send / receive plumbing -------------------------------------
 
+    def _next_available_mid_locked(self):
+        """Return the next MID that is not owned by a live request."""
+        for _ in range(0x10000):
+            self._mid = (self._mid + 1) & 0xFFFF
+            if self._mid not in self._pending_mids:
+                return self._mid
+        raise SessionError()
+
     def _next_mid(self):
         with self._state_lock:
-            self._mid = (self._mid + 1) & 0xFFFF
-            return self._mid
+            return self._next_available_mid_locked()
+
+    def _register_pending_request(self, tok, ev, container):
+        """Atomically allocate a MID and index one request by MID and token."""
+        with self._state_lock:
+            if tok in self._pending:
+                raise SessionError()
+            mid = self._next_available_mid_locked()
+            pending = (ev, container)
+            exchange = _MidExchange(pending)
+            self._pending[tok] = pending
+            self._pending_mids[mid] = exchange
+        return mid, exchange
+
+    def _unregister_pending_request(self, tok, mid, exchange):
+        """Remove only the exact request registered under both indices."""
+        with self._state_lock:
+            if self._pending.get(tok) is exchange.pending:
+                self._pending.pop(tok, None)
+            if self._pending_mids.get(mid) is exchange:
+                self._pending_mids.pop(mid, None)
+
+    def _close_pending_requests(self):
+        """Fail, unregister, and wake every request that can no longer finish."""
+        with self._state_lock:
+            pending_by_id = {
+                id(record): record for record in self._pending.values()
+            }
+            pending_by_id.update(
+                (id(exchange.pending), exchange.pending)
+                for exchange in self._pending_mids.values()
+            )
+            pending = list(pending_by_id.values())
+            for _ev, container in pending:
+                container.setdefault('err', SessionClosedError())
+            self._pending.clear()
+            self._pending_mids.clear()
+        for ev, _container in pending:
+            ev.set()
 
     def _next_tok(self):
         with self._state_lock:
@@ -640,11 +698,7 @@ class DtlsCoapSession:
             # Reader no longer owns the socket — callers must fail fast.
             self._reader_running.clear()
             # Make sure pending waiters don't hang if the reader dies.
-            with self._state_lock:
-                pending = list(self._pending.items())
-            for tok, (ev, container) in pending:
-                container.setdefault('err', SessionClosedError())
-                ev.set()
+            self._close_pending_requests()
             # Nothing will answer a refetch now either.
             with self._refetch_cond:
                 self._refetch_pending.clear()
@@ -663,6 +717,17 @@ class DtlsCoapSession:
                         kind, fmt_code(code), mid, tok.hex() or '-',
                         len(ropts), len(payload))
 
+        # RFC 7252 empty messages are exactly the four-byte v1 header with
+        # TKL=0 and code=0. parse_coap() intentionally stays a lightweight
+        # general parser, so validate the raw shape before a control frame is
+        # allowed to mutate a MID-indexed exchange.
+        bare_control = (
+            len(datagram) == 4
+            and datagram[0] >> 6 == 1
+            and datagram[0] & 0x0F == 0
+            and code == 0
+        )
+
         # ACK back any CON from the device to suppress retransmits.
         # RFC 7252 §4.2 — ACK is a bare frame (token len 0, code 0).
         if mt == TYPE_CON:
@@ -674,19 +739,44 @@ class DtlsCoapSession:
         # Empty ACK with no options & no payload = "separate response
         # coming" — used by Samsung's RT-OCF for the larger reads. Stop
         # the retransmit timer on the client side and wait for the CON.
-        if mt == TYPE_ACK and code == 0 and not payload and not ropts:
+        if mt == TYPE_ACK and code == 0:
+            if not bare_control:
+                return
+            with self._state_lock:
+                exchange = self._pending_mids.get(mid)
+                if exchange is not None:
+                    exchange.acknowledged = True
+                    ev, _container = exchange.pending
+            if exchange is not None:
+                ev.set()
+            return
+
+        # A reset rejects the matching exchange. Like an empty ACK it has no
+        # response token, so surface it through the request's MID registry.
+        if mt == TYPE_RST:
+            if not bare_control:
+                return
+            with self._state_lock:
+                exchange = self._pending_mids.get(mid)
+                if exchange is not None:
+                    ev, container = exchange.pending
+                    if 'code' not in container and 'err' not in container:
+                        container['err'] = SessionError()
+            if exchange is not None:
+                ev.set()
             return
 
         # Pending one-shot? Resolve and return.
         with self._state_lock:
             rec = self._pending.get(tok)
+            if rec is not None:
+                ev, container = rec
+                container['code']    = code
+                container['mtype']   = mt
+                container['mid']     = mid
+                container['options'] = ropts
+                container['payload'] = payload
         if rec is not None:
-            ev, container = rec
-            container['code']    = code
-            container['mtype']   = mt
-            container['mid']     = mid
-            container['options'] = ropts
-            container['payload'] = payload
             ev.set()
             return
 
@@ -935,10 +1025,12 @@ class DtlsCoapSession:
         for attempt in range(_BLOCK_MAX_ATTEMPTS):
             ev = threading.Event()
             container = {}
-            with self._state_lock:
-                self._pending[tok] = (ev, container)
+            mid, exchange = self._register_pending_request(tok, ev, container)
             try:
-                mid = self._next_mid()
+                # Close the reader-death registration race: after this request
+                # is visible to reader-finally, recheck that the reader still
+                # owns the session before sending.
+                self._check_live()
                 opts = [(URI_PATH, s.encode()) for s in path_segs]
                 for q in query:
                     opts.append((URI_QUERY, q.encode()))
@@ -948,19 +1040,33 @@ class DtlsCoapSession:
                 self._send_dgram(
                     build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
                 while True:
-                    per_wait = min(_BLOCK_ACK_TIMEOUT,
-                                   max(0.1, deadline - time.time()))
+                    with self._state_lock:
+                        if ('err' in container
+                                or ('code' in container
+                                    and self._block_num_matches(
+                                        container, num))):
+                            return container
+                        if 'code' in container:
+                            logger.debug(
+                                "GET %s /%s block %d: stale block, "
+                                "still waiting",
+                                self.host, '/'.join(path_segs), num,
+                            )
+                            container.clear()
+                        acknowledged = exchange.acknowledged
+                        ev.clear()
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        if acknowledged:
+                            raise SessionTimeoutError()
+                        break
+                    per_wait = (
+                        remaining if acknowledged
+                        else min(_BLOCK_ACK_TIMEOUT, max(0.1, remaining))
+                    )
                     if not self._wait_for_block(ev, per_wait):
-                        break  # attempt timed out
-                    if 'err' in container or self._block_num_matches(
-                            container, num):
-                        return container
-                    logger.debug(
-                        "GET %s /%s block %d: stale block, still waiting",
-                        self.host, '/'.join(path_segs), num)
-                    ev.clear()
-                    container.clear()
-                    if deadline - time.time() <= 0:
+                        if acknowledged:
+                            raise SessionTimeoutError()
                         break
                 remaining = deadline - time.time()
                 if remaining <= 0 or attempt == _BLOCK_MAX_ATTEMPTS - 1:
@@ -975,8 +1081,7 @@ class DtlsCoapSession:
                     attempt + 1, _BLOCK_MAX_ATTEMPTS,
                 )
             finally:
-                with self._state_lock:
-                    self._pending.pop(tok, None)
+                self._unregister_pending_request(tok, mid, exchange)
         raise SessionTimeoutError()
 
     def _wait_for_block(self, ev, per_wait):
@@ -1015,28 +1120,44 @@ class DtlsCoapSession:
         (code, payload_bytes). body_cbor must already be encoded."""
         self._check_live()
         tok = self._next_tok()
-        mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
         opts.append((CONTENT_FORMAT, CF_CBOR))
         opts.append((ACCEPT, CF_CBOR))
-        datagram = build_coap(TYPE_CON, METHOD_POST, mid, tok, opts,
-                              body_cbor)
         ev = threading.Event()
         container = {}
-        with self._state_lock:
-            self._pending[tok] = (ev, container)
+        mid, exchange = self._register_pending_request(tok, ev, container)
         try:
             self.pace()
+            # The reader can exit between the entry liveness check and the
+            # registration above. Recheck after registration so its teardown
+            # cannot miss this waiter.
             self._check_live()
+            datagram = build_coap(TYPE_CON, METHOD_POST, mid, tok, opts,
+                                  body_cbor)
             self._send_dgram(datagram)
-            if not ev.wait(timeout):
-                raise SessionTimeoutError()
-            if 'err' in container:
-                raise container['err']
-            return container['code'], container['payload']
+            deadline = time.time() + timeout
+            while True:
+                with self._state_lock:
+                    error = container.get('err')
+                    has_response = 'code' in container
+                    response = (
+                        (container['code'], container['payload'])
+                        if has_response else None
+                    )
+                    if error is None and not has_response:
+                        ev.clear()
+                if error is not None:
+                    raise error
+                if has_response:
+                    return response
+                remaining = deadline - time.time()
+                if remaining <= 0 or not ev.wait(remaining):
+                    raise SessionTimeoutError()
+                # An empty ACK only stops retransmission. POST does not retry
+                # today, but keeping the acknowledged exchange pending here is
+                # the common contract the write retry path will build on.
         finally:
-            with self._state_lock:
-                self._pending.pop(tok, None)
+            self._unregister_pending_request(tok, mid, exchange)
 
     def ping(self):
         """RFC 7252 §4.4 CoAP Ping — empty CON, no token, no payload.

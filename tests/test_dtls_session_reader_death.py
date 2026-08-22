@@ -135,6 +135,26 @@ def test_fatal_socket_error_exits_with_warning(caplog):
     assert "reader exiting" in warnings[0].getMessage()
 
 
+def test_fatal_reader_exit_drains_mid_registry_and_wakes_waiters():
+    sess = _make_session()
+    pending = []
+    for token in (b"get", b"post"):
+        event = threading.Event()
+        container = {}
+        sess._register_pending_request(token, event, container)
+        pending.append((event, container))
+
+    _run_reader(sess, [OSError(errno.EBADF, "bad file descriptor")])
+
+    assert sess._pending == {}
+    assert sess._pending_mids == {}
+    assert all(event.is_set() for event, _container in pending)
+    assert all(
+        isinstance(container.get("err"), SessionClosedError)
+        for _event, container in pending
+    )
+
+
 def test_request_fails_fast_after_reader_death():
     sess = _make_session()
     _run_reader(sess, [OSError(errno.EBADF, "bad file descriptor")])
