@@ -386,7 +386,6 @@ class PushBridge:
     def _run_session_inner(self, sess):
         for path in self.descriptor.observe_paths:
             sess.subscribe(path)
-            time.sleep(0.05)
 
         # Inline seed so the publish gate opens before the scheduler's
         # first tick. The scheduler's sweep tier will refresh /device/0
