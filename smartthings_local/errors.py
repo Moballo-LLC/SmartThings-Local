@@ -10,6 +10,8 @@ __all__ = [
     'ProbeError',
     'SessionClosedError',
     'SessionError',
+    'SessionIdentifierError',
+    'SessionResetError',
     'SessionTimeoutError',
     'SmartThingsLocalError',
 ]
@@ -80,6 +82,30 @@ class SessionClosedError(SessionError):
 
     code = 'session_closed'
     message = 'session is closed'
+
+
+class SessionResetError(SessionError):
+    """The peer rejected an exchange with a CoAP RST.
+
+    Distinct from a closed session: the transport is still up and every
+    other exchange on it is unaffected. Only the message the RST names has
+    been refused.
+    """
+
+    code = 'session_reset'
+    message = 'peer reset the exchange'
+
+
+class SessionIdentifierError(SessionError):
+    """No free Message ID or token was available for a new exchange.
+
+    Every identifier in the space is held by an exchange that has not yet
+    completed, which in practice means requests are leaking rather than
+    that the session is genuinely saturated.
+    """
+
+    code = 'session_identifier'
+    message = 'no free message identifier for a new exchange'
 
 
 class MalformedMessageError(SmartThingsLocalError, ValueError):

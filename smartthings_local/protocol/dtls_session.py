@@ -40,6 +40,8 @@ from ..errors import (
     EndpointError,
     SessionClosedError,
     SessionError,
+    SessionIdentifierError,
+    SessionResetError,
     SessionTimeoutError,
 )
 from .coap import (
@@ -528,12 +530,19 @@ class DtlsCoapSession:
     # ---- send / receive plumbing -------------------------------------
 
     def _next_available_mid_locked(self):
-        """Return the next MID that is not owned by a live request."""
-        for _ in range(0x10000):
+        """Return the next MID that is not owned by a live request.
+
+        Probing one more candidate than there are live exchanges is enough
+        by the pigeonhole principle: the candidates are consecutive and so
+        distinct, and at most len(_pending_mids) of them can be taken. In
+        practice that means a single probe, instead of a walk over all
+        65,536 identifiers to discover what the dict size already implied.
+        """
+        for _ in range(min(len(self._pending_mids) + 1, 0x10000)):
             self._mid = (self._mid + 1) & 0xFFFF
             if self._mid not in self._pending_mids:
                 return self._mid
-        raise SessionError()
+        raise SessionIdentifierError()
 
     def _next_mid(self):
         with self._state_lock:
@@ -543,7 +552,7 @@ class DtlsCoapSession:
         """Atomically allocate a MID and index one request by MID and token."""
         with self._state_lock:
             if tok in self._pending:
-                raise SessionError()
+                raise SessionIdentifierError()
             mid = self._next_available_mid_locked()
             pending = (ev, container)
             exchange = _MidExchange(pending)
@@ -761,7 +770,7 @@ class DtlsCoapSession:
                 if exchange is not None:
                     ev, container = exchange.pending
                     if 'code' not in container and 'err' not in container:
-                        container['err'] = SessionError()
+                        container['err'] = SessionResetError()
             if exchange is not None:
                 ev.set()
             return
@@ -1021,24 +1030,30 @@ class DtlsCoapSession:
         A response whose Block2 NUM is not the one we asked for is a
         retransmit of an earlier block, not the next one. Concatenating
         it would corrupt the buffer, so keep waiting on the same
-        attempt budget instead."""
-        for attempt in range(_BLOCK_MAX_ATTEMPTS):
-            ev = threading.Event()
-            container = {}
-            mid, exchange = self._register_pending_request(tok, ev, container)
-            try:
+        attempt budget instead.
+
+        Every attempt sends the byte-identical datagram, so the exchange is
+        registered once outside the loop. RFC 7252 §4.2 defines a
+        retransmission as the same message, and a fresh MID per attempt
+        instead presents each retry to the appliance as a brand-new
+        request that it may answer separately."""
+        ev = threading.Event()
+        container = {}
+        mid, exchange = self._register_pending_request(tok, ev, container)
+        opts = [(URI_PATH, s.encode()) for s in path_segs]
+        for q in query:
+            opts.append((URI_QUERY, q.encode()))
+        opts.append((ACCEPT, CF_CBOR))
+        if num > 0:
+            opts.append((BLOCK2, block_value(num, 0, szx)))
+        datagram = build_coap(TYPE_CON, METHOD_GET, mid, tok, opts)
+        try:
+            for attempt in range(_BLOCK_MAX_ATTEMPTS):
                 # Close the reader-death registration race: after this request
                 # is visible to reader-finally, recheck that the reader still
                 # owns the session before sending.
                 self._check_live()
-                opts = [(URI_PATH, s.encode()) for s in path_segs]
-                for q in query:
-                    opts.append((URI_QUERY, q.encode()))
-                opts.append((ACCEPT, CF_CBOR))
-                if num > 0:
-                    opts.append((BLOCK2, block_value(num, 0, szx)))
-                self._send_dgram(
-                    build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+                self._send_dgram(datagram)
                 while True:
                     with self._state_lock:
                         if ('err' in container
@@ -1080,8 +1095,8 @@ class DtlsCoapSession:
                     self.host, '/'.join(path_segs), num,
                     attempt + 1, _BLOCK_MAX_ATTEMPTS,
                 )
-            finally:
-                self._unregister_pending_request(tok, mid, exchange)
+        finally:
+            self._unregister_pending_request(tok, mid, exchange)
         raise SessionTimeoutError()
 
     def _wait_for_block(self, ev, per_wait):
