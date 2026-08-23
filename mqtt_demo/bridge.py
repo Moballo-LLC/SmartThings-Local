@@ -348,6 +348,7 @@ class PushBridge:
             key_path=self.shared.KEY_PATH,
             on_notification=self._on_notification,
             local_port=DTLS_LOCAL_PORT_BASE + self.app.index,
+            write_max_attempts=self.shared.WRITE_MAX_ATTEMPTS,
         )
         sess.connect()
         self.port = port

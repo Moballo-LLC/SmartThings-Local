@@ -58,6 +58,7 @@ class SharedConfig:
     HA_DISCOVERY_PREFIX: str
     HEALTH_INTERVAL_S: int
     PING_INTERVAL_S: int
+    WRITE_MAX_ATTEMPTS: int
 
     @classmethod
     def from_env(cls) -> 'SharedConfig':
@@ -72,6 +73,7 @@ class SharedConfig:
                                           'homeassistant'),
             HEALTH_INTERVAL_S=int(os.getenv('HEALTH_INTERVAL_S', '60')),
             PING_INTERVAL_S=int(os.getenv('PING_INTERVAL_S', '25')),
+            WRITE_MAX_ATTEMPTS=int(os.getenv('WRITE_MAX_ATTEMPTS', '1')),
         )
 
 
