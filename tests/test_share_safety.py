@@ -156,3 +156,29 @@ def test_committed_scan_ignores_unchanged_findings_but_checks_added_lines(
     assert check_share_safety.check_changed(base) == [
         check_share_safety.Finding("candidate.txt", 3, "NON_DOCUMENTATION_IPV4")
     ]
+
+
+def test_scope_operators_are_not_read_as_ipv6_addresses():
+    """`Foo::bar` matches the IPv6 pattern and parses as an address in
+    ::/8. Reserved blocks are not assignable to a host, so an address in
+    one cannot be the leak this rule exists to catch."""
+    colons = 2 * chr(58)
+    for text in (
+        "the leaf's `TbsCertificate" + colons + "signature_alg` is unparseable",
+        "see `std" + colons + "vector` and `Face" + colons + "expressRequest`",
+        "0" + colons + "1 is the discard prefix",
+    ):
+        assert check_share_safety.scan_text("doc.md", text) == []
+
+
+def test_host_assignable_ipv6_addresses_are_still_flagged():
+    colons = 2 * chr(58)
+    for text in (
+        "fe80" + colons + "1",          # link-local
+        "fd00" + colons + "1",          # unique-local
+        "2400" + chr(58) + "cb00" + colons + "1",  # global unicast
+    ):
+        findings = check_share_safety.scan_text("doc.md", text)
+        assert [finding.rule_id for finding in findings] == [
+            "NON_DOCUMENTATION_IPV6"
+        ], text
