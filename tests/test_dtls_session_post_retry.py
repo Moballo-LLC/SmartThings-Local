@@ -296,6 +296,56 @@ def test_reader_death_mid_write_fails_fast():
     assert elapsed < 2.0, f"post() waited {elapsed:.2f}s instead of failing fast"
 
 
+def test_a_response_delivered_as_the_reader_tore_down_is_not_lost():
+    """The liveness guard above covers the reader exiting during a pace. The
+    other half is the reader's own teardown: _reader_loop's finally calls
+    _close_pending_requests(), which stamped a closed-session error onto
+    every pending container — including one already holding the response it
+    had just dispatched. Both callers read 'err' before 'code', so a write
+    the device confirmed came back as SessionClosedError."""
+    sess = _session()
+    sess._reader_thread = threading.Thread(target=lambda: None)
+    sess._reader_running.set()
+    tok = _token_of(sess)
+
+    def _deliver_then_tear_down(_datagram):
+        sess.sent.append(_datagram)
+
+        def _reader_exit():
+            with sess._state_lock:
+                ev, container = sess._pending[tok]
+                container.update(code=0x44, payload=b"ok")
+            ev.set()
+            # _reader_loop's finally, in order.
+            sess._reader_running.clear()
+            sess._close_pending_requests()
+
+        thread = threading.Thread(target=_reader_exit)
+        thread.start()
+        thread.join()           # teardown wins the race, deterministically
+
+    sess._send_dgram = _deliver_then_tear_down
+
+    assert sess.post(["power", "vs", "0"], b"\xa0", timeout=5.0) == (0x44, b"ok")
+
+
+def test_teardown_does_not_overwrite_an_answered_exchange():
+    """The same guard, at its source: shared by post() and _exchange_block,
+    so the read path gets it too — a final block dispatched as the reader
+    exits is an answer, not a closed session."""
+    sess = _session()
+    answered_ev, answered = threading.Event(), {"code": 0x45, "payload": b"ok"}
+    silent_ev, silent = threading.Event(), {}
+    sess._register_pending_request(b"answered", answered_ev, answered)
+    sess._register_pending_request(b"silent", silent_ev, silent)
+
+    sess._close_pending_requests()
+
+    assert "err" not in answered, "teardown discarded a dispatched response"
+    assert isinstance(silent["err"], SessionClosedError)
+    assert answered_ev.is_set() and silent_ev.is_set()
+
+
 def test_a_failed_retransmit_does_not_abort_the_exchange(monkeypatch):
     """A connected UDP socket reports the ICMP error queued by an earlier
     send on the *next* one, and the reader treats those errnos as advisory.

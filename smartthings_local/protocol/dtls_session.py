@@ -611,7 +611,13 @@ class DtlsCoapSession:
             )
             pending = list(pending_by_id.values())
             for _ev, container in pending:
-                container.setdefault('err', SessionClosedError())
+                # Only fail an exchange that has no answer yet. A response
+                # the reader dispatched before it tore down is a real one —
+                # the request finished, the session merely died after it —
+                # and both callers check 'err' before 'code', so stamping
+                # one here discards a write the device already confirmed.
+                if 'code' not in container:
+                    container.setdefault('err', SessionClosedError())
             self._pending.clear()
             self._pending_mids.clear()
         for ev, _container in pending:
