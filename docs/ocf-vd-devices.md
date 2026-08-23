@@ -87,7 +87,9 @@ of this, and are not reproduced here.
 ### Remarks
 
 Recorded so the next reader does not have to rediscover them, and explicitly
-not validated except where noted:
+not validated except where noted. Neither route is implemented here: the
+closest the library comes is `derive_mfg_certificate_owner_psk`, a pure
+derivation with no caller.
 
 - Removing a device from SmartThings returns it to the unowned OCF state —
   the manufacturer-OTM window `ocf-pki-laundry.md` describes. It may
