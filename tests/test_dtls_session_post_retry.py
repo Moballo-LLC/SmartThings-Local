@@ -396,3 +396,20 @@ def test_the_caller_timeout_bounds_the_pace_too():
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.9, f"post() took {elapsed:.2f}s for a 0.5s timeout"
+
+
+def test_refresh_observes_paces_the_dereg_sweep():
+    sess = _session()
+    sess._observe_tokens = {b"\x41": "/power/vs/0", b"\x42": "/oven/vs/0"}
+    calls = []
+    sess.pace = lambda: calls.append("pace")
+    sess._send_observe_dereg = lambda *_a: calls.append("dereg")
+    sess.subscribe = lambda *_a: calls.append("subscribe")
+
+    sess.refresh_observes([("power", "vs", "0"), ("oven", "vs", "0")])
+
+    # This dereg runs against a session that has to keep working afterwards,
+    # so the burst is paced (LocalThings#396). The subscribe sweep is not
+    # paced here on purpose — subscribe() is where that belongs, and #51 put
+    # it there; the sleep that used to stand in for it is gone with #59's.
+    assert calls == ["pace", "dereg", "pace", "dereg", "subscribe", "subscribe"]

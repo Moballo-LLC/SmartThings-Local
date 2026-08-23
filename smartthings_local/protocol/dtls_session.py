@@ -1312,18 +1312,23 @@ class DtlsCoapSession:
         old token gets dropped as 'stale' — acceptable for a 6h-scale
         safety net."""
         self._check_live()
+        # Paced, unlike the teardown dereg in close(): that one wants out
+        # quickly and the session is finished either way, while this one
+        # runs against a session that has to keep working afterwards, and an
+        # unpaced OBSERVE burst is what wedges an appliance until something
+        # forces a new session (LocalThings#396). The subscribe sweep below
+        # needs nothing here — subscribe() paces its own send.
         for tok, href in list(self._observe_tokens.items()):
             segs = [s for s in href.split('/') if s]
             try:
+                self.pace()
                 self._send_observe_dereg(tok, segs)
             except Exception as e:
                 logger.warning("refresh dereg %s: %s", href, e)
         self._observe_tokens.clear()
-        time.sleep(0.1)
         for path in paths:
             try:
                 self.subscribe(list(path))
-                time.sleep(0.05)
             except Exception as e:
                 logger.warning("refresh subscribe %s: %s", path, e)
 
