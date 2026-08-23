@@ -77,6 +77,31 @@ Setting the signal stops subscribed connection attempts and closes their
 temporary UDP sockets. It does not alter an already established session or add
 new session lifecycle methods. Interrupted attempts raise `SessionClosedError`.
 
+Reads retransmit each Block2 request; writes send once. Where a lost write
+has been shown to be the cause rather than a device that is simply refusing
+load, `write_max_attempts` lets `post()` retransmit inside the caller's own
+timeout, backing off per RFC 7252 §4.2 and pacing every retransmit:
+
+```python
+sess = DtlsCoapSession("192.0.2.100", 49154, auth=auth, write_max_attempts=3)
+```
+
+Each attempt resends the byte-identical datagram, so a server implementing
+§4.5 can recognise the duplicate and answer from its dedupe cache instead of
+re-running the write. Retrying from the caller cannot do that — a second
+`post()` mints a fresh Message ID, which is a new request. It defaults to `1`
+(send once) because retransmitting into an appliance that is already dropping
+under load turns one lost write into several, and §4.5 dedupe is unverified on
+RT-OCF.
+
+Note that `post()`'s `timeout` bounds the whole call, rate-limit pacing
+included, rather than only the wait that follows the send. Every attempt has to
+share one budget, and a caller that asked for 8 seconds should not wait 8
+seconds plus however long the limiter withheld the request. At the default 5
+req/s that is at most 200 ms of the budget; at a hand-tuned `rate_limit_rps=1.0`
+it is a full second, so a caller pairing a low rate limit with a short timeout
+should raise the timeout to match.
+
 If the cert/key are minted at runtime and never written to disk (e.g. inside
 an HA config flow), create the provider from memory instead:
 

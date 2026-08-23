@@ -104,6 +104,14 @@ DEBUG_BRIDGE = os.environ.get('DEBUG_BRIDGE') == '1'
 _BLOCK_MAX_ATTEMPTS = 3
 _BLOCK_ACK_TIMEOUT  = 4.0
 
+# Base per-attempt wait for a write retransmission, doubled per attempt
+# (RFC 7252 §4.2). Retransmission itself is off by default: a device that
+# is already dropping under load turns one lost write into several, and
+# MID dedupe (§4.5) is unverified on RT-OCF, which does not reliably emit
+# RST either. Enable per session via write_max_attempts once pacing has
+# been shown insufficient on real hardware (LocalThings#384).
+_WRITE_ACK_TIMEOUT = 2.0
+
 # How often a request wait re-checks that the reader is still alive. Short
 # enough that a mid-exchange reader death fails fast instead of burning
 # the whole per-attempt timeout, long enough to stay off the CPU.
@@ -250,6 +258,7 @@ class DtlsCoapSession:
                  on_notification=None, mtu=1200,
                  rate_limit_rps: float = _DEFAULT_RATE_LIMIT_RPS,
                  local_port=None, family=socket.AF_UNSPEC,
+                 write_max_attempts: int = 1,
                  auth: AuthenticationProvider | None = None):
         file_supplied = cert_path is not None or key_path is not None
         memory_supplied = cert_pem is not None or key_pem is not None
@@ -283,6 +292,7 @@ class DtlsCoapSession:
         self.on_notification = on_notification  # fn(href, payload_bytes)
         self.mtu = mtu
         self._min_req_interval = 1.0 / rate_limit_rps
+        self._write_max_attempts = max(1, int(write_max_attempts))
         # Optional fixed UDP source port. A client that dies without
         # close_notify leaves an orphaned DTLS association on the device,
         # keyed to the old 5-tuple; reconnecting from a fresh ephemeral
@@ -1153,7 +1163,17 @@ class DtlsCoapSession:
 
     def post(self, path_segs, body_cbor, timeout=8.0):
         """Single-frame POST with a CBOR-encoded body. Returns
-        (code, payload_bytes). body_cbor must already be encoded."""
+        (code, payload_bytes). body_cbor must already be encoded.
+
+        timeout bounds the whole call, pacing included, so post() returns
+        within it rather than within it plus a rate-limit interval.
+
+        Retransmits the CON up to write_max_attempts times within that
+        deadline, reusing the same Message ID: that is what lets a
+        server implementing RFC 7252 §4.5 answer a duplicate from its dedupe
+        cache instead of re-running a non-idempotent write. A caller-side
+        retry cannot offer that, since it mints a fresh MID and token.
+        Defaults to one attempt — see _WRITE_ACK_TIMEOUT."""
         self._check_live()
         tok = self._next_tok()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
@@ -1162,38 +1182,97 @@ class DtlsCoapSession:
         ev = threading.Event()
         container = {}
         mid, exchange = self._register_pending_request(tok, ev, container)
+        # Built once and resent verbatim: §4.2 defines a retransmission as
+        # the same message, and a fresh MID would present each retry to the
+        # appliance as a brand-new write it may run again.
+        datagram = build_coap(TYPE_CON, METHOD_POST, mid, tok, opts,
+                              body_cbor)
+        attempts = self._write_max_attempts
+        # Armed before the first pace, not after the send: every attempt
+        # shares one budget, and a caller that asked for 8s should not wait
+        # 8s plus however long the rate limiter withheld the request.
+        deadline = time.time() + timeout
         try:
-            # See get(): a reader can die after the entry check but before
-            # registration. This post-registration snapshot fails closed.
-            self.pace()
-            # The reader can exit between the entry liveness check and the
-            # registration above. Recheck after registration so its teardown
-            # cannot miss this waiter.
-            self._check_live()
-            datagram = build_coap(TYPE_CON, METHOD_POST, mid, tok, opts,
-                                  body_cbor)
-            self._send_dgram(datagram)
-            deadline = time.time() + timeout
-            while True:
+            for attempt in range(attempts):
+                self.pace()
                 with self._state_lock:
-                    error = container.get('err')
-                    has_response = 'code' in container
-                    response = (
-                        (container['code'], container['payload'])
-                        if has_response else None
-                    )
-                    if error is None and not has_response:
-                        ev.clear()
-                if error is not None:
-                    raise error
-                if has_response:
-                    return response
-                remaining = deadline - time.time()
-                if remaining <= 0 or not ev.wait(remaining):
-                    raise SessionTimeoutError()
-                # An empty ACK only stops retransmission. POST does not retry
-                # today, but keeping the acknowledged exchange pending here is
-                # the common contract the write retry path will build on.
+                    answered = 'code' in container or 'err' in container
+                    acknowledged = exchange.acknowledged
+                # Neither can be true before the first send, so attempt 0 is
+                # byte-for-byte the single send this used to do. On a
+                # retransmit either one means the datagram arrived: the
+                # answer landed while we paced, or the device acked it
+                # separately and owes us only the response.
+                if not answered:
+                    # The reader can exit between the entry liveness check
+                    # and the registration above, and again during any pace.
+                    # Rechecking here closes that race — but only while
+                    # nothing has answered, because an answer that beat a
+                    # dying reader is a write the device confirmed and must
+                    # not be discarded as a closed session.
+                    self._check_live()
+                    if not acknowledged:
+                        try:
+                            self._send_dgram(datagram)
+                        except EndpointError:
+                            # Attempt 0 is the caller's only datagram, so its
+                            # failure is theirs to see. A retransmit is
+                            # best-effort: a connected UDP socket reports the
+                            # ICMP error queued by an earlier send on the next
+                            # one, and the reader treats those same errnos as
+                            # advisory. Failing the exchange on one would make
+                            # retransmitting less robust than not bothering,
+                            # while the original datagram may still be
+                            # answered inside the budget already running.
+                            if not attempt:
+                                raise
+                            logger.debug(
+                                "POST %s /%s: retransmit %d/%d send failed",
+                                self.host, '/'.join(path_segs),
+                                attempt + 1, attempts,
+                            )
+                last = attempt == attempts - 1
+                while True:
+                    with self._state_lock:
+                        error = container.get('err')
+                        has_response = 'code' in container
+                        response = (
+                            (container['code'], container['payload'])
+                            if has_response else None
+                        )
+                        if error is None and not has_response:
+                            ev.clear()
+                        acknowledged = exchange.acknowledged
+                    if error is not None:
+                        raise error
+                    if has_response:
+                        return response
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        raise SessionTimeoutError()
+                    # An empty ACK stops retransmission (§5.2.2): the device
+                    # took the write and owes only the separate response, so
+                    # spend the rest of the caller's budget waiting for it.
+                    if acknowledged or last:
+                        per_wait = remaining
+                    else:
+                        per_wait = min(_WRITE_ACK_TIMEOUT * (2 ** attempt),
+                                       remaining)
+                    if self._wait_live(ev, per_wait):
+                        continue        # something moved — re-read the state
+                    if acknowledged or last:
+                        raise SessionTimeoutError()
+                    break               # attempt exhausted, retransmit
+                # Retry only if the next attempt's pace still fits inside the
+                # caller's deadline: pace() sleeps up to a whole interval, so
+                # asking merely for "any budget left" returns late.
+                if deadline - time.time() <= self._min_req_interval:
+                    break
+                logger.debug(
+                    "POST %s /%s: attempt %d/%d timeout, retransmitting",
+                    self.host, '/'.join(path_segs), attempt + 1, attempts,
+                )
+            raise SessionTimeoutError()
         finally:
             self._unregister_pending_request(tok, mid, exchange)
 
