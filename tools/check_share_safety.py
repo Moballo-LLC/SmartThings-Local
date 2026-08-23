@@ -128,7 +128,17 @@ def _safe_ipv4(value: str) -> bool:
 def _safe_ipv6(value: str) -> bool:
     address = ipaddress.ip_address(value.strip("[]").split("%", 1)[0])
     return (
-        address.is_loopback or address.is_unspecified or address in DOCUMENTATION_IPV6
+        address.is_loopback
+        or address.is_unspecified
+        or address in DOCUMENTATION_IPV6
+        # An address in an IETF-reserved block is not assignable to a host,
+        # so it cannot be the leak this rule exists to catch. Excluding them
+        # also clears a false positive on C++ and Rust scope operators: a
+        # scope operator preceded by a hex letter matches IPV6_RE, parses as
+        # an address in the all-zero reserved block, and is nobody's device.
+        # Global unicast, link-local and unique-local all sit outside the
+        # reserved set and stay flagged; see the tests for each.
+        or address.is_reserved
     )
 
 
