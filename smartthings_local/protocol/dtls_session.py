@@ -104,9 +104,9 @@ DEBUG_BRIDGE = os.environ.get('DEBUG_BRIDGE') == '1'
 _BLOCK_MAX_ATTEMPTS = 3
 _BLOCK_ACK_TIMEOUT  = 4.0
 
-# How often a block wait re-checks that the reader is still alive. Short
-# enough that a mid-transfer reader death fails fast instead of burning
-# the whole per-block timeout, long enough to stay off the CPU.
+# How often a request wait re-checks that the reader is still alive. Short
+# enough that a mid-exchange reader death fails fast instead of burning
+# the whole per-attempt timeout, long enough to stay off the CPU.
 _BLOCK_LIVENESS_POLL_S = 0.25
 
 # Inter-request pacing: minimum seconds between CoAP CON sends on one session.
@@ -1095,7 +1095,7 @@ class DtlsCoapSession:
                         remaining if acknowledged
                         else min(_BLOCK_ACK_TIMEOUT, max(0.1, remaining))
                     )
-                    if not self._wait_for_block(ev, per_wait):
+                    if not self._wait_live(ev, per_wait):
                         if acknowledged:
                             raise SessionTimeoutError()
                         break
@@ -1115,8 +1115,16 @@ class DtlsCoapSession:
             self._unregister_pending_request(tok, mid, exchange)
         raise SessionTimeoutError()
 
-    def _wait_for_block(self, ev, per_wait):
-        """Wait for a block response while checking reader liveness."""
+    def _wait_live(self, ev, per_wait):
+        """Wait for one response, giving up early if the reader dies
+        underneath us.
+
+        Only the reader thread can resolve a token, so once it is gone
+        the wait can never succeed. Polling in slices turns what would
+        be a full per-attempt timeout into an immediate SessionClosedError,
+        which is the same fail-fast contract get() and post() get from
+        _check_live() at entry — it just has to hold for the whole
+        exchange, not only its first moment."""
         deadline = time.monotonic() + per_wait
         while True:
             slice_s = min(

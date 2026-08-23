@@ -61,7 +61,7 @@ def test_get_retransmission_reuses_one_mid_and_datagram(monkeypatch):
 
     # Answer only once the third attempt is on the wire, so two full
     # retransmissions have to happen first.
-    def wait_for_block(_event, _timeout):
+    def wait_live(_event, _timeout):
         if len(sent) < 3:
             return False
         _mtype, _code, mid, token, _options, _payload = parse_coap(sent[-1])
@@ -70,7 +70,7 @@ def test_get_retransmission_reuses_one_mid_and_datagram(monkeypatch):
         )
         return True
 
-    session._wait_for_block = wait_for_block
+    session._wait_live = wait_live
 
     assert session.get(["device", "0"], timeout=5.0) == (0x45, b"ok")
 
@@ -85,7 +85,7 @@ def test_get_retransmission_reuses_one_mid_and_datagram(monkeypatch):
 def test_exhausted_attempts_still_release_the_single_registration():
     session = _session()
     session._send_dgram = lambda _datagram: None
-    session._wait_for_block = lambda _event, _timeout: False
+    session._wait_live = lambda _event, _timeout: False
 
     with pytest.raises(SessionTimeoutError):
         session.get(["device", "0"], timeout=0.05)

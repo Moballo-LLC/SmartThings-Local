@@ -460,7 +460,7 @@ def test_empty_ack_survives_stale_block_until_separate_response(
         sess._dispatch_coap(build_empty_ack(mid))
         pending['token'] = token
 
-    def wait_for_block(_event, per_wait):
+    def wait_live(_event, per_wait):
         waits.append(per_wait)
         token = pending['token']
         if len(waits) == 1:
@@ -486,7 +486,7 @@ def test_empty_ack_survives_stale_block_until_separate_response(
         return True
 
     sess._send_dgram = respond
-    sess._wait_for_block = wait_for_block
+    sess._wait_live = wait_live
     sess.pace = lambda: None
     assert sess.get(['oic', 'res'], timeout=0.2) == (
         0x45,

@@ -111,7 +111,7 @@ def test_empty_ack_stops_get_retransmission(monkeypatch):
         requests.append((mid, token))
         session._dispatch_coap(build_coap(TYPE_ACK, 0, mid, b"", []))
 
-    def wait_for_block(_event, timeout):
+    def wait_live(_event, timeout):
         waits.append(timeout)
         mid, token = requests[-1]
         session._dispatch_coap(
@@ -120,7 +120,7 @@ def test_empty_ack_stops_get_retransmission(monkeypatch):
         return True
 
     session._send_dgram = send
-    session._wait_for_block = wait_for_block
+    session._wait_live = wait_live
 
     assert session.get(["device", "0"], timeout=1.0) == (0x45, b"ok")
     assert len(requests) == 1
@@ -215,7 +215,7 @@ def test_failure_paths_unregister_both_indices(operation, outcome):
     else:
         session._send_dgram = lambda _datagram: None
         if operation == "get":
-            session._wait_for_block = lambda _event, _timeout: False
+            session._wait_live = lambda _event, _timeout: False
         expected = SessionTimeoutError
         timeout = 0.0
 
