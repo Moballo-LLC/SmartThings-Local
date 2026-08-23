@@ -500,7 +500,7 @@ def test_empty_ack_survives_stale_block_until_separate_response(
     assert sess._pending_mids == {}
 
 
-def test_get_preserves_mid_transfer_error_payload_contract():
+def test_get_returns_only_the_error_body_when_a_transfer_fails_mid_way():
     sess = _make_session()
 
     def respond(datagram):
@@ -527,7 +527,7 @@ def test_get_preserves_mid_transfer_error_payload_contract():
 
     sess._send_dgram = respond
     sess.pace = lambda: None
-    assert sess.get(['oic', 'res']) == (0x80, b'a' * 16 + b'error')
+    assert sess.get(['oic', 'res']) == (0x80, b'error')
 
 
 @pytest.mark.parametrize('method', ('get', 'post'))

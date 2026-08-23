@@ -434,7 +434,7 @@ def test_block2_continuation_requires_an_explicit_block2_option():
         ))
 
 
-def test_mid_transfer_error_preserves_connected_session_contract_by_default():
+def test_mid_transfer_error_replaces_the_partial_representation():
     error = _message(
         code=0x80,
         payload=b'error',
@@ -450,7 +450,20 @@ def test_mid_transfer_error_preserves_connected_session_contract_by_default():
     ))
     assert accumulator.add_response(error) == BLOCK2_COMPLETE
     assert accumulator.code == 0x80
-    assert accumulator.payload == b'a' * 16 + b'error'
+    assert accumulator.payload == b'error'
+
+
+def test_error_before_any_block_returns_the_diagnostic_body():
+    accumulator = Block2Accumulator(b'token')
+    assert accumulator.add_response(_message(
+        code=0x80,
+        payload=b'error',
+        include_block=False,
+        etag=None,
+        content_format=None,
+    )) == BLOCK2_COMPLETE
+    assert accumulator.code == 0x80
+    assert accumulator.payload == b'error'
 
 
 def test_block2_accumulator_enforces_exact_block_and_payload_bounds():
@@ -493,6 +506,34 @@ def test_block2_accumulator_enforces_exact_block_and_payload_bounds():
     too_large = Block2Accumulator(b'token', max_payload_bytes=16)
     with pytest.raises(BlockwiseError):
         too_large.add_response(_message(
+            payload=b'x' * 17,
+            include_block=False,
+            etag=None,
+            content_format=None,
+        ))
+
+    # An error body is bounded on its own length, since it replaces the
+    # accumulated blocks rather than extending them: a diagnostic that fits
+    # is accepted however many bytes arrived before it.
+    after_blocks = Block2Accumulator(b'token', max_payload_bytes=16)
+    after_blocks.add_response(_message(
+        number=0,
+        more=True,
+        payload=b'a' * 16,
+    ))
+    assert after_blocks.add_response(_message(
+        code=0x80,
+        payload=b'x' * 16,
+        include_block=False,
+        etag=None,
+        content_format=None,
+    )) == BLOCK2_COMPLETE
+    assert after_blocks.payload == b'x' * 16
+
+    oversized_error = Block2Accumulator(b'token', max_payload_bytes=16)
+    with pytest.raises(BlockwiseError):
+        oversized_error.add_response(_message(
+            code=0x80,
             payload=b'x' * 17,
             include_block=False,
             etag=None,
