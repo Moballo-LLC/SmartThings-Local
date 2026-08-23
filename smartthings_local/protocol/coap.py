@@ -490,15 +490,19 @@ class Block2Accumulator:
         if message.code == 0:
             raise BlockwiseError()
 
-        # A non-success response terminates the logical GET immediately while
-        # preserving the connected-session contract of returning bytes already
-        # accumulated before and in the error response.
+        # A non-success response terminates the logical GET. Its body is a
+        # diagnostic in the server's own format rather than a continuation of
+        # the representation, so it replaces whatever blocks arrived instead
+        # of extending them: get() returns (code, payload) with no boundary
+        # marker between the two, so concatenating leaves the caller one
+        # buffer holding two content types and no way to split it. Callers
+        # gate on 2.05 before decoding, so the accumulated bytes have no
+        # reader once the code is not 2.xx.
         if message.code >> 5 != 2:
-            if len(self._payload) + len(message.payload) > \
-                    self._max_payload_bytes:
+            if len(message.payload) > self._max_payload_bytes:
                 raise BlockwiseError()
             self._code = message.code
-            self._payload.extend(message.payload)
+            self._payload = bytearray(message.payload)
             self._blocks_received += 1
             self._complete = True
             return BLOCK2_COMPLETE
