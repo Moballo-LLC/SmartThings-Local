@@ -1,12 +1,14 @@
-"""Bounded discovery of OCF-advertised secure UDP ports.
+"""Bounded plaintext OCF reads and advertised secure-port discovery.
 
-This known-host API requires the target's public CoAP request port to already
+These known-host APIs require the target's public CoAP request port to already
 be known. UDP 5683 is a convenience default, not a port-discovery mechanism;
 callers must locate and explicitly pass a different public port when the
-target does not listen there. A response may still originate from another
-source port, so this module uses unconnected UDP sockets, validates the
-resolved target address and CoAP token, then pins the first valid response
-endpoint for the remainder of each bounded Block2 transfer.
+target does not listen there. ``read_plaintext_ocf_resource`` returns the raw
+representation and response code for one absolute href. A response may still
+originate from another source port, so this module uses unconnected UDP
+sockets, validates the resolved target address and CoAP token, then pins the
+first valid response endpoint for the remainder of each bounded Block2
+transfer.
 
 Discovery first reads the unfiltered ``/oic/res`` directory and accepts only
 secure ``eps`` entries bound to that response source. If the representation
@@ -49,7 +51,9 @@ from .endpoint import ResolvedUdpEndpoint, resolve_udp_endpoints
 
 __all__ = [
     'OcfSecurePortDiscoveryResult',
+    'PlaintextOcfResourceResult',
     'discover_ocf_secure_ports',
+    'read_plaintext_ocf_resource',
 ]
 
 _DISCOVERY_PORT = 5683
@@ -60,6 +64,8 @@ _MAX_DATAGRAM_BYTES = 8192
 _MAX_PAYLOAD_BYTES = 65536
 _MAX_LINKS = 256
 _MAX_ENDPOINT_URIS_PER_LINK = 32
+_MAX_REQUEST_OPTION_BYTES = 1024
+_MAX_REQUEST_OPTION_COUNT = 32
 _OCF_CBOR_CONTENT_FORMAT = 10000
 _CONTENT = 0x45
 _PRIMARY_QUERY = ()
@@ -79,6 +85,48 @@ _PORTS_UNTRUSTED = 'untrusted'
 _ENDPOINT_IGNORE = 'ignore'
 _ENDPOINT_MATCH = 'match'
 _ENDPOINT_UNTRUSTED = 'untrusted'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PlaintextOcfResourceResult:
+    """Redacted outcome of one bounded plaintext OCF resource read.
+
+    A complete non-success response is still a valid result: inspect
+    ``successful`` before decoding ``payload``. ``content_format`` and
+    ``size2`` describe a successful representation and remain ``None`` for a
+    non-success diagnostic body. The custom representation deliberately omits
+    the payload, target, resource path, and wire data.
+    """
+
+    code: int | None
+    payload: bytes
+    blocks_received: int
+    content_format: int | None
+    size2: int | None
+    attempts: int
+    response_received: bool
+    error_code: str | None = None
+
+    @property
+    def complete(self):
+        """Return whether a complete correlated response was received."""
+        return self.code is not None and self.error_code is None
+
+    @property
+    def successful(self):
+        """Return whether the complete response has a 2.xx CoAP code."""
+        return self.complete and self.code >> 5 == 2
+
+    def __repr__(self):
+        return (
+            'PlaintextOcfResourceResult('
+            f'complete={self.complete!r}, successful={self.successful!r}, '
+            f'code={self.code!r}, payload_bytes={len(self.payload)}, '
+            f'blocks_received={self.blocks_received}, '
+            f'attempts={self.attempts}, '
+            f'response_received={self.response_received!r}, '
+            f'error_code={self.error_code!r})'
+        )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -126,15 +174,21 @@ class _TransferResult:
     code: int | None
     family: int | None
     source_key: tuple[bytes, int] | None
+    blocks_received: int
+    content_format: int | None
+    size2: int | None
     attempts: int
     response_received: bool
 
 
-def _validate_options(discovery_port, timeout, retries, family):
-    if isinstance(discovery_port, bool) or not isinstance(discovery_port, int):
-        raise TypeError('discovery_port must be an integer')
-    if not 1 <= discovery_port <= 65535:
-        raise ValueError('discovery_port must be between 1 and 65535')
+def _validate_port(port, *, name):
+    if isinstance(port, bool) or not isinstance(port, int):
+        raise TypeError(f'{name} must be an integer')
+    if not 1 <= port <= 65535:
+        raise ValueError(f'{name} must be between 1 and 65535')
+
+
+def _validate_transport_options(timeout, retries, family):
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
         raise TypeError('timeout must be a number')
     if not math.isfinite(timeout) or not 0 < timeout <= 30:
@@ -147,6 +201,51 @@ def _validate_options(discovery_port, timeout, retries, family):
         raise TypeError('family must be an address-family integer')
     if family not in (socket.AF_UNSPEC, socket.AF_INET, socket.AF_INET6):
         raise ValueError('family must be AF_UNSPEC, AF_INET, or AF_INET6')
+
+
+def _validate_options(discovery_port, timeout, retries, family):
+    _validate_port(discovery_port, name='discovery_port')
+    _validate_transport_options(timeout, retries, family)
+
+
+def _validated_text_values(values, *, name, allow_empty):
+    """Return bounded UTF-8 option values without echoing caller data."""
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise TypeError(f'{name} must be an iterable of strings')
+    try:
+        iterator = iter(values)
+    except TypeError:
+        raise TypeError(f'{name} must be an iterable of strings') from None
+
+    result = []
+    for value in iterator:
+        if len(result) >= _MAX_REQUEST_OPTION_COUNT:
+            raise ValueError(f'{name} must contain at most 32 values')
+        if not isinstance(value, str):
+            raise TypeError(f'{name} values must be strings')
+        try:
+            encoded = value.encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError(f'{name} values must be valid UTF-8') from None
+        if (not allow_empty and not encoded) or \
+                len(encoded) > _MAX_REQUEST_OPTION_BYTES:
+            raise ValueError(f'{name} values must be non-empty and bounded')
+        result.append(encoded)
+    return tuple(result)
+
+
+def _validated_resource_target(href, query):
+    if not isinstance(href, str):
+        raise TypeError('href must be a string')
+    if (not href.startswith('/') or href == '/' or href.endswith('/')
+            or '//' in href or '?' in href or '#' in href):
+        raise ValueError(
+            'href must be an absolute resource path with non-empty segments')
+    path = _validated_text_values(
+        href[1:].split('/'), name='href segments', allow_empty=False)
+    query = _validated_text_values(
+        query, name='query', allow_empty=False)
+    return path, query
 
 
 def _host_key(family, sockaddr):
@@ -203,6 +302,19 @@ def _open_routes(endpoints, selector):
                 except OSError:
                     pass
     return routes
+
+
+def _close_routes(routes, selector):
+    for route in routes:
+        try:
+            selector.unregister(route.sock)
+        except (KeyError, OSError, ValueError):
+            pass
+        try:
+            route.sock.close()
+        except OSError:
+            pass
+    selector.close()
 
 
 def _decode_cbor(payload):
@@ -382,19 +494,25 @@ def _fallback_secure_ports_from_payload(payload, family, source_key):
 def _transfer_result(
         status, *, attempts, response_received, accumulator=None, route=None):
     complete = accumulator is not None and accumulator.complete
+    successful = complete and accumulator.code >> 5 == 2
     return _TransferResult(
         status=status,
         payload=accumulator.payload if complete else b'',
         code=accumulator.code if complete else None,
         family=route.endpoint.family if complete and route is not None else None,
         source_key=route.host_key if complete and route is not None else None,
+        blocks_received=(
+            accumulator.blocks_received if accumulator is not None else 0),
+        content_format=(
+            accumulator.content_format if successful else None),
+        size2=accumulator.size2 if successful else None,
         attempts=attempts,
         response_received=response_received,
     )
 
 
-def _fetch_directory(
-        routes, selector, *, query, cutoff, retries, used_mids):
+def _fetch_resource(
+        routes, selector, *, path, query, cutoff, retries, used_mids):
     """Fetch one representation without retaining an address in its repr."""
     token = secrets.token_bytes(8)
     accumulator = Block2Accumulator(
@@ -431,7 +549,7 @@ def _fetch_directory(
                 TYPE_NON,
                 mid,
                 token,
-                (b'oic', b'res'),
+                path,
                 query,
                 block_number=(
                     accumulator.expected_number
@@ -554,12 +672,14 @@ def _fetch_directory(
                 status,
                 attempts=attempts,
                 response_received=response_received,
+                accumulator=accumulator,
             )
 
     return _transfer_result(
         _TRANSFER_MALFORMED,
         attempts=attempts,
         response_received=response_received,
+        accumulator=accumulator,
     )
 
 
@@ -582,6 +702,79 @@ def _extraction_for_transfer(transfer, *, fallback):
         if fallback else _primary_secure_ports_from_payload
     )
     return extractor(transfer.payload, transfer.family, transfer.source_key)
+
+
+def _resource_result(transfer):
+    error_codes = {
+        _TRANSFER_ENDPOINT_UNAVAILABLE: 'endpoint_unavailable',
+        _TRANSFER_MALFORMED: 'malformed_ocf_response',
+        _TRANSFER_NO_RESPONSE: 'no_ocf_response',
+    }
+    error_code = error_codes.get(transfer.status)
+    return PlaintextOcfResourceResult(
+        code=transfer.code,
+        payload=transfer.payload,
+        blocks_received=transfer.blocks_received,
+        content_format=transfer.content_format,
+        size2=transfer.size2,
+        attempts=transfer.attempts,
+        response_received=transfer.response_received,
+        error_code=error_code,
+    )
+
+
+def read_plaintext_ocf_resource(
+        host, href, *, query=(), port=_DISCOVERY_PORT, timeout=3.0,
+        retries=1, family=socket.AF_UNSPEC):
+    """Read one known plaintext OCF resource under fixed transfer bounds.
+
+    ``href`` is an absolute resource path and ``query`` contains individual
+    URI-Query values. ``port`` must already be known; this function does not
+    scan or multicast. A response may originate from a different port on the
+    resolved target address, which is pinned after the first correlated
+    response for all Block2 continuations.
+
+    Name resolution happens synchronously first. ``timeout`` then bounds the
+    complete request, retries, and Block2 continuations. The result preserves
+    complete non-2.xx responses so callers can distinguish authorization from
+    reachability. This plaintext read neither authenticates the appliance nor
+    grants access to protected resources.
+    """
+    _validate_port(port, name='port')
+    _validate_transport_options(timeout, retries, family)
+    path, query = _validated_resource_target(href, query)
+
+    try:
+        endpoints = resolve_udp_endpoints(host, port, family=family)
+    except OSError:
+        return PlaintextOcfResourceResult(
+            None, b'', 0, None, None, 0, False,
+            error_code='endpoint_unavailable',
+        )
+
+    selector = selectors.DefaultSelector()
+    routes = _open_routes(endpoints, selector)
+    if not routes:
+        selector.close()
+        return PlaintextOcfResourceResult(
+            None, b'', 0, None, None, 0, False,
+            error_code='endpoint_unavailable',
+        )
+
+    deadline = time.monotonic() + float(timeout)
+    try:
+        transfer = _fetch_resource(
+            routes,
+            selector,
+            path=path,
+            query=query,
+            cutoff=deadline,
+            retries=retries,
+            used_mids=set(),
+        )
+        return _resource_result(transfer)
+    finally:
+        _close_routes(routes, selector)
 
 
 def discover_ocf_secure_ports(
@@ -623,9 +816,10 @@ def discover_ocf_secure_ports(
     used_mids = set()
 
     try:
-        primary = _fetch_directory(
+        primary = _fetch_resource(
             routes,
             selector,
+            path=(b'oic', b'res'),
             query=_PRIMARY_QUERY,
             cutoff=primary_cutoff,
             retries=retries,
@@ -654,9 +848,10 @@ def discover_ocf_secure_ports(
         # with no usable secure eps are the only fallback conditions. The
         # fallback gets a fresh token, accumulator, and peer pin and starts at
         # the original public discovery routes.
-        fallback_result = _fetch_directory(
+        fallback_result = _fetch_resource(
             routes,
             selector,
+            path=(b'oic', b'res'),
             query=_FALLBACK_QUERY,
             cutoff=deadline,
             retries=retries,
@@ -685,13 +880,4 @@ def discover_ocf_secure_ports(
                 (), attempts, response_received, 'malformed_ocf_response')
         return _result((), attempts, response_received, 'no_secure_ports')
     finally:
-        for route in routes:
-            try:
-                selector.unregister(route.sock)
-            except (KeyError, OSError, ValueError):
-                pass
-            try:
-                route.sock.close()
-            except OSError:
-                pass
-        selector.close()
+        _close_routes(routes, selector)
