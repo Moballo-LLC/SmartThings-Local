@@ -63,6 +63,14 @@ def test_dtls_session_constructor_keeps_file_memory_and_local_port_inputs():
     auth_parameter = inspect.signature(DtlsCoapSession).parameters["auth"]
     assert auth_parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert auth_parameter.default is None
+    for callback in (
+        "on_legacy_notification",
+        "on_observe_pending",
+        "on_observe_error",
+    ):
+        parameter = inspect.signature(DtlsCoapSession).parameters[callback]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
 
 
 def test_known_host_multicast_discovery_has_a_bounded_explicit_interface_api():
@@ -212,6 +220,11 @@ def test_dtls_session_keeps_current_consumer_methods():
             "timeout",
         ],
     )
+    subscribe_query = inspect.signature(DtlsCoapSession.subscribe).parameters[
+        "query"
+    ]
+    assert subscribe_query.kind is inspect.Parameter.KEYWORD_ONLY
+    assert subscribe_query.default == ()
     get_extra_options = inspect.signature(DtlsCoapSession.get).parameters[
         "extra_options"
     ]

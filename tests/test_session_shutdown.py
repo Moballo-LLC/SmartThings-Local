@@ -253,4 +253,4 @@ def test_normal_close_still_deregisters_before_quiescing(monkeypatch):
 
     session.close()
 
-    assert calls == [(b"o", ["mode", "vs", "0"])]
+    assert calls == [(b"o", ["mode", "vs", "0"], ())]

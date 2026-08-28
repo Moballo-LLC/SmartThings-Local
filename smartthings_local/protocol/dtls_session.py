@@ -133,7 +133,7 @@ _BLOCK_LIVENESS_POLL_S = 0.25
 # once the ceiling is measured empirically.
 _DEFAULT_RATE_LIMIT_RPS = 5.0
 
-# Maximum hrefs held for OBSERVE refetch at once. A notification storm
+# Maximum relations held for OBSERVE refetch at once. A notification storm
 # on more resources than this is already past what the 5/s ceiling can
 # drain, so the excess is dropped rather than queued indefinitely.
 _MAX_PENDING_REFETCH = 16
@@ -142,6 +142,13 @@ _MAX_PENDING_REFETCH = 16
 # the resource is known large (that is why it blocked) and the worker
 # is serialized, so a slow one delays only later refetches.
 _REFETCH_TIMEOUT_S = 15.0
+
+# RFC 7641 section 3.4 compares the 24-bit Observe value as serial-number
+# arithmetic. After 128 seconds without an accepted notification, receipt time
+# is allowed to re-establish ordering after a server restart.
+_OBSERVE_SEQUENCE_MODULUS = 1 << 24
+_OBSERVE_SEQUENCE_HALF_RANGE = 1 << 23
+_OBSERVE_SEQUENCE_RESET_S = 128.0
 
 
 class _EtagChanged(Exception):
@@ -351,7 +358,10 @@ class DtlsCoapSession:
                  rate_limit_rps: float = _DEFAULT_RATE_LIMIT_RPS,
                  local_port=None, family=socket.AF_UNSPEC,
                  write_max_attempts: int = 1,
-                 auth: AuthenticationProvider | None = None):
+                 auth: AuthenticationProvider | None = None,
+                 on_legacy_notification=None,
+                 on_observe_pending=None,
+                 on_observe_error=None):
         file_supplied = cert_path is not None or key_path is not None
         memory_supplied = cert_pem is not None or key_pem is not None
         if auth is not None and (file_supplied or memory_supplied):
@@ -382,6 +392,9 @@ class DtlsCoapSession:
                 auth = CertificateAuth.from_files(self.cert_path, self.key_path)
         self.auth = auth
         self.on_notification = on_notification  # fn(href, payload_bytes)
+        self.on_legacy_notification = on_legacy_notification
+        self.on_observe_pending = on_observe_pending
+        self.on_observe_error = on_observe_error
         self.mtu = mtu
         self._min_req_interval = 1.0 / rate_limit_rps
         self._write_max_attempts = max(1, int(write_max_attempts))
@@ -436,9 +449,20 @@ class DtlsCoapSession:
         self._pending_mids = {}
         # token (bytes) → href (str)
         self._observe_tokens = {}
+        # An Observe relation is identified by path plus URI query. Keep the
+        # exact registration options for refetch and deregistration.
+        self._observe_queries = {}
+        # Some Samsung generations return a plain initial 2.05 and later push
+        # on the same token without RFC 7641's Observe option. One later packet
+        # with a different MID is required before that relation is trusted.
+        self._observe_plain_response_mids = {}
+        self._legacy_observe_tokens = set()
+        self._legacy_observe_mids = {}
+        # token → (last accepted 24-bit Observe value, monotonic receipt time)
+        self._observe_sequences = {}
 
-        # OBSERVE refetch queue: href → sequence number of the newest
-        # notification that asked for it. Drained by a worker thread
+        # OBSERVE refetch queue: (href, query, legacy) → sequence number of the
+        # newest notification that asked for it. Drained by a worker thread
         # because _dispatch_coap cannot block (see _queue_refetch).
         self._refetch_cond = threading.Condition()
         self._refetch_pending = {}
@@ -630,13 +654,15 @@ class DtlsCoapSession:
         if self._refetch_thread is not None:
             self._refetch_thread.join()
 
-    def _send_observe_dereg(self, tok, path_segs):
+    def _send_observe_dereg(self, tok, path_segs, query=()):
         """Send a single OBSERVE deregister GET (Observe option = 1)
         on the existing token. Best-effort — caller swallows errors."""
         if self.conn is None:
             return
         mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
+        for value in query:
+            opts.append((URI_QUERY, value.encode()))
         opts.append((OBSERVE, OBSERVE_DEREGISTER))
         opts.append((ACCEPT, CF_CBOR))
         self._send_dgram(
@@ -689,10 +715,14 @@ class DtlsCoapSession:
         # before we shut DTLS down.
         if (not self._lifecycle_cancel.is_set() and self.conn is not None
                 and self._observe_tokens):
-            for tok, href in list(self._observe_tokens.items()):
+            with self._state_lock:
+                observations = tuple(self._observe_tokens.items())
+                observe_queries = dict(self._observe_queries)
+            for tok, href in observations:
                 segs = [s for s in href.split('/') if s]
                 try:
-                    self._send_observe_dereg(tok, segs)
+                    self._send_observe_dereg(
+                        tok, segs, observe_queries.get(tok, ()))
                 except Exception as e:
                     logger.warning("dereg %s: %s", href, e)
             time.sleep(0.1)
@@ -715,8 +745,7 @@ class DtlsCoapSession:
             self.conn = None
             self.dest = None
             self.endpoint = None
-        with self._state_lock:
-            self._observe_tokens.clear()
+        self._clear_observe_relations()
 
     def abort(self):
         """Immediately stop work and close the established transport."""
@@ -732,8 +761,7 @@ class DtlsCoapSession:
                 sock.close()
             except Exception:
                 pass
-        with self._state_lock:
-            self._observe_tokens.clear()
+        self._clear_observe_relations()
 
     # ---- send / receive plumbing -------------------------------------
 
@@ -807,19 +835,45 @@ class DtlsCoapSession:
             # avoids collisions across long-running OBSERVE subscriptions.
             return self._tok_counter.to_bytes(4, 'big')
 
-    def _next_observe_tok(self):
-        with self._state_lock:
-            # Single-byte tokens for OBSERVE registrations. Samsung
-            # RT-OCF accepts these but silently drops TKL=4 OBSERVE
-            # registrations. Counter is randomly seeded per session so
-            # reconnects don't collide with stale observer state Samsung
-            # may still be holding from the previous run.
+    def _next_available_observe_tok_locked(self):
+        """Return an unused nonzero one-byte Observe token."""
+        for _ in range(min(len(self._observe_tokens) + 1, 0xFF)):
             self._observe_tok_counter = (self._observe_tok_counter + 1) & 0xFF
-            # Avoid 0x00 — some CoAP stacks treat an all-zero token as
-            # equivalent to "no token" / empty (TKL=0).
             if self._observe_tok_counter == 0:
                 self._observe_tok_counter = 1
-            return bytes([self._observe_tok_counter])
+            token = bytes([self._observe_tok_counter])
+            if token not in self._observe_tokens:
+                return token
+        raise SessionIdentifierError()
+
+    def _retire_observe_token_locked(self, tok):
+        """Remove every relation-state index for one Observe token."""
+        self._observe_tokens.pop(tok, None)
+        self._observe_queries.pop(tok, None)
+        self._observe_plain_response_mids.pop(tok, None)
+        self._legacy_observe_tokens.discard(tok)
+        self._legacy_observe_mids.pop(tok, None)
+        self._observe_sequences.pop(tok, None)
+
+    def _clear_observe_relations(self):
+        with self._state_lock:
+            self._observe_tokens.clear()
+            self._observe_queries.clear()
+            self._observe_plain_response_mids.clear()
+            self._legacy_observe_tokens.clear()
+            self._legacy_observe_mids.clear()
+            self._observe_sequences.clear()
+
+    @staticmethod
+    def _observe_sequence_is_fresh(previous, current, received_at):
+        """Apply RFC 7641's 24-bit serial-number freshness comparison."""
+        if previous is None:
+            return True
+        previous_value, previous_received_at = previous
+        if received_at - previous_received_at > _OBSERVE_SEQUENCE_RESET_S:
+            return True
+        delta = (current - previous_value) % _OBSERVE_SEQUENCE_MODULUS
+        return 0 < delta < _OBSERVE_SEQUENCE_HALF_RANGE
 
     def _send_dgram(self, datagram):
         """Send a CoAP datagram. Holds the send lock for the
@@ -1007,23 +1061,101 @@ class DtlsCoapSession:
             return
 
         # OBSERVE notification?
-        href = self._observe_tokens.get(tok)
+        with self._state_lock:
+            href = self._observe_tokens.get(tok)
+            observe_query = self._observe_queries.get(tok, ())
         if href is not None:
             if code != 0x45:
-                logger.warning("observe %s: non-2.05 %s",
-                               href, fmt_code(code))
+                with self._state_lock:
+                    self._retire_observe_token_locked(tok)
+                logger.debug("observe %s: non-2.05 %s",
+                             href, fmt_code(code))
+                cb = self.on_observe_error
+                if cb is not None:
+                    try:
+                        cb(href, code)
+                    except Exception as e:
+                        logger.debug("observe error callback %s: %s", href, e)
                 return
+            block_values = [
+                value for number, value in ropts if number == BLOCK2
+            ]
+            blockwise_refetch = False
+            if block_values:
+                if len(block_values) != 1 or len(block_values[0]) > 3:
+                    logger.debug("observe %s: malformed Block2 option", href)
+                    return
+                try:
+                    block_number, more, _ = block_fields(block_values[0])
+                except ValueError:
+                    logger.debug("observe %s: malformed Block2 option", href)
+                    return
+                blockwise_refetch = bool(more or block_number)
+            observe_values = [
+                value for number, value in ropts if number == OBSERVE
+            ]
+            legacy = False
+            if observe_values:
+                if len(observe_values) != 1 or len(observe_values[0]) > 3:
+                    logger.debug("observe %s: malformed Observe option", href)
+                    return
+                sequence = int.from_bytes(observe_values[0], 'big')
+                received_at = time.monotonic()
+                with self._state_lock:
+                    previous = self._observe_sequences.get(tok)
+                    if not self._observe_sequence_is_fresh(
+                            previous, sequence, received_at):
+                        return
+                    self._observe_sequences[tok] = (sequence, received_at)
+                    self._observe_plain_response_mids.pop(tok, None)
+                    self._legacy_observe_tokens.discard(tok)
+                    self._legacy_observe_mids.pop(tok, None)
+            else:
+                pending = False
+                with self._state_lock:
+                    if tok in self._observe_sequences:
+                        return
+                    initial_mid = self._observe_plain_response_mids.get(tok)
+                    if tok in self._legacy_observe_tokens:
+                        if self._legacy_observe_mids.get(tok) == mid:
+                            return
+                        self._legacy_observe_mids[tok] = mid
+                        legacy = True
+                    elif initial_mid is None:
+                        self._observe_plain_response_mids[tok] = mid
+                        pending = True
+                    elif initial_mid == mid:
+                        return
+                    else:
+                        self._legacy_observe_tokens.add(tok)
+                        self._legacy_observe_mids[tok] = mid
+                        legacy = True
+                if pending:
+                    logger.debug(
+                        "observe %s: probationary 2.05 without Observe option",
+                        href,
+                    )
+                    cb = self.on_observe_pending
+                    if cb is not None:
+                        try:
+                            cb(href)
+                        except Exception as e:
+                            logger.debug(
+                                "observe pending callback %s: %s", href, e)
+                    return
             # RFC 7959 §2.6: a notification carries only the first block
             # of the representation. Handing the callback a partial CBOR
             # buffer is what #39 was about, so anything with M=1 (or a
             # block past the first) goes to the refetch worker instead.
-            b2 = [v for n, v in ropts if n == BLOCK2]
-            if b2:
-                num, more, _ = block_fields(b2[0])
-                if more or num:
-                    self._queue_refetch(href)
-                    return
-            cb = self.on_notification
+            if blockwise_refetch:
+                self._queue_refetch(
+                    href, tuple(observe_query), legacy=legacy)
+                return
+            cb = (
+                self.on_legacy_notification
+                if legacy and self.on_legacy_notification is not None
+                else self.on_notification
+            )
             if cb is not None:
                 try:
                     cb(href, payload)
@@ -1045,23 +1177,24 @@ class DtlsCoapSession:
         without also turning on every per-block retransmit line."""
         (logger.info if DEBUG_BRIDGE else logger.debug)(msg, *args)
 
-    def _queue_refetch(self, href):
+    def _queue_refetch(self, href, query=(), *, legacy=False):
         """Queue a blockwise notification for re-reading.
 
         Called from the reader thread, so it must not block: _dispatch_coap
         runs there and _blockwise_get waits on an Event only that same
         thread can set, which would deadlock the session outright. Latest
-        wins per href — a burst of notifications on one resource collapses
-        into a single re-read of its final state."""
+        wins per relation — a burst of notifications for one path/query shape
+        collapses into a single re-read of its final state."""
+        key = (href, tuple(query), bool(legacy))
         with self._refetch_cond:
-            if (href not in self._refetch_pending
+            if (key not in self._refetch_pending
                     and len(self._refetch_pending) >= _MAX_PENDING_REFETCH):
                 self._log_refetch(
                     "refetch %s dropped: queue full (%d pending)",
                     href, len(self._refetch_pending))
                 return
             self._refetch_seq += 1
-            self._refetch_pending[href] = self._refetch_seq
+            self._refetch_pending[key] = self._refetch_seq
             self._refetch_cond.notify()
         self._start_refetch_worker()
 
@@ -1091,9 +1224,9 @@ class DtlsCoapSession:
                     self._refetch_cond.wait(1.0)
                 if not self._refetch_pending:
                     return
-                href, seq = next(iter(self._refetch_pending.items()))
-                del self._refetch_pending[href]
-            self._refetch_one(href, seq)
+                key, seq = next(iter(self._refetch_pending.items()))
+                del self._refetch_pending[key]
+            self._refetch_one(key, seq)
 
     def _refetch_alive(self):
         """False once the session is closing or the reader has died. A
@@ -1103,14 +1236,15 @@ class DtlsCoapSession:
             return False
         return self._reader_thread is None or self._reader_running.is_set()
 
-    def _refetch_one(self, href, seq):
+    def _refetch_one(self, key, seq):
         """Re-read one href from block 0 and deliver it if it is still
         the freshest thing we know about that resource."""
+        href, query, legacy = key
         self.pace()
         segs = [s for s in href.split('/') if s]
         try:
             code, payload, blocks, tok = self._blockwise_get(
-                segs, (), _REFETCH_TIMEOUT_S)
+                segs, query, _REFETCH_TIMEOUT_S)
         except Exception as e:
             # Device silent, session gone, ETag never settled, block cap
             # hit. Whatever the reason, dropping the notification is the
@@ -1124,14 +1258,18 @@ class DtlsCoapSession:
         with self._refetch_cond:
             # A newer notification landed while we were reading. That one
             # has its own refetch queued, so this result is already stale.
-            if self._refetch_pending.get(href, 0) > seq:
+            if self._refetch_pending.get(key, 0) > seq:
                 self._log_refetch(
                     "refetch %s tok=%s blocks=%d bytes=%d superseded",
                     href, tok.hex(), blocks, len(payload))
                 return
         self._log_refetch("refetch %s tok=%s blocks=%d bytes=%d ok",
                           href, tok.hex(), blocks, len(payload))
-        cb = self.on_notification
+        cb = (
+            self.on_legacy_notification
+            if legacy and self.on_legacy_notification is not None
+            else self.on_notification
+        )
         if cb is not None:
             try:
                 cb(href, payload)
@@ -1788,21 +1926,34 @@ class DtlsCoapSession:
         # unpaced OBSERVE burst is what wedges an appliance until something
         # forces a new session (LocalThings#396). The subscribe sweep below
         # needs nothing here — subscribe() paces its own send.
-        for tok, href in list(self._observe_tokens.items()):
+        normalized_paths = tuple(tuple(path) for path in paths)
+        with self._state_lock:
+            observations = tuple(self._observe_tokens.items())
+            observe_queries = dict(self._observe_queries)
+        queries_by_href = {}
+        for tok, href in observations:
+            queries_by_href.setdefault(href, []).append(
+                observe_queries.get(tok, ()))
+        for tok, href in observations:
             segs = [s for s in href.split('/') if s]
             try:
                 self.pace()
-                self._send_observe_dereg(tok, segs)
+                self._send_observe_dereg(
+                    tok, segs, observe_queries.get(tok, ()))
             except Exception as e:
                 logger.warning("refresh dereg %s: %s", href, e)
-        self._observe_tokens.clear()
-        for path in paths:
-            try:
-                self.subscribe(list(path))
-            except Exception as e:
-                logger.warning("refresh subscribe %s: %s", path, e)
+            with self._state_lock:
+                self._retire_observe_token_locked(tok)
+        for path in normalized_paths:
+            href = '/' + '/'.join(path)
+            queries = queries_by_href.get(href, [()])
+            for query in queries:
+                try:
+                    self.subscribe(list(path), query=query)
+                except Exception as e:
+                    logger.warning("refresh subscribe %s: %s", path, e)
 
-    def subscribe(self, path_segs):
+    def subscribe(self, path_segs, *, query=()):
         """Register an OBSERVE on the given path. The initial 2.05
         notification and all subsequent state-change notifications
         will fire on_notification(href, payload_bytes).
@@ -1810,17 +1961,28 @@ class DtlsCoapSession:
         Returns the token used (in case the caller wants to deregister
         later)."""
         self._check_live()
+        path_segs = _validated_text_options(
+            path_segs, name='path_segs', allow_empty=False)
+        query = _validated_text_options(
+            query, name='query', allow_empty=False)
         self.pace()
         self._check_live()
-        tok = self._next_observe_tok()
         href = '/' + '/'.join(path_segs)
         # Register the token BEFORE sending — otherwise the device
         # could respond between send() and the dict insert, and the
         # reader thread would drop the initial 2.05 as "stale".
         with self._state_lock:
+            tok = self._next_available_observe_tok_locked()
             self._observe_tokens[tok] = href
-        mid = self._next_mid()
+            self._observe_queries[tok] = query
+            try:
+                mid = self._next_available_mid_locked()
+            except Exception:
+                self._retire_observe_token_locked(tok)
+                raise
         opts = [(URI_PATH, s.encode()) for s in path_segs]
+        for value in query:
+            opts.append((URI_QUERY, value.encode()))
         opts.append((OBSERVE, OBSERVE_REGISTER))
         opts.append((ACCEPT, CF_CBOR))
         try:
@@ -1828,6 +1990,6 @@ class DtlsCoapSession:
                 build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
         except Exception:
             with self._state_lock:
-                self._observe_tokens.pop(tok, None)
+                self._retire_observe_token_locked(tok)
             raise
         return tok
