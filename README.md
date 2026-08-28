@@ -343,6 +343,45 @@ Returned ports are unauthenticated candidates, not DTLS endpoints; directory
 parsing, DTLS liveness, and authenticated device identity remain separate
 checks.
 
+### Bounded plaintext OCF resource reads
+
+Once the public request port is known, callers can read an absolute OCF href
+without reimplementing the source-port and Block2 handling used by directory
+discovery:
+
+```python
+import cbor2
+
+from smartthings_local.protocol.ocf_discovery import (
+    read_plaintext_ocf_resource,
+)
+
+resource = read_plaintext_ocf_resource(
+    "192.0.2.20",
+    "/oic/d",
+    port=5683,
+)
+if resource.successful:
+    device = cbor2.loads(resource.payload)
+elif resource.complete:
+    print(f"appliance returned CoAP code {resource.code:#04x}")
+else:
+    print(resource.error_code)
+```
+
+The reader sends a read-only NON GET and returns the raw body instead of
+assuming one representation shape. It keeps one token across Block2, pins a
+different response source port after the first correlated reply, uses a fresh
+message ID for each request attempt, and applies one deadline plus the same
+32-block, 64-KiB, and datagram bounds as directory discovery. Successful
+representations must either omit Content-Format or identify OCF/CoAP CBOR.
+
+A complete 4.xx or 5.xx response is returned with its code and body rather
+than converted into a transport failure. Public resources vary by firmware:
+reaching a plaintext endpoint does not authenticate the appliance or grant
+access to protected appliance data. `content_format` and `size2` describe
+successful representations; they are `None` for a non-success diagnostic body.
+
 For a full worked integration, the higher-level `smartthings_local.ocf` layer (`StateCache`, `PollScheduler`, `KeepaliveTask`, `ObserveRefreshTask`) coordinates tiered polling and OBSERVE on top of a session. The MQTT bridge demo below wires all of it together.
 
 ### What the demo bridge gives you
