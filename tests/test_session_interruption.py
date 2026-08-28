@@ -100,7 +100,7 @@ def _install_connection(monkeypatch, connection, data_socket, *, on_open=None):
     return endpoint
 
 
-def _run_connect(session, cancel):
+def _run_connect(session, cancel=None):
     outcome = {}
 
     def worker():
@@ -216,6 +216,91 @@ def test_cancel_wakes_blocked_connect_without_poll_latency(monkeypatch):
         assert not cancel._writers
     finally:
         cancel.set()
+        thread.join(1.0)
+        peer.close()
+
+
+def test_quiesce_wakes_blocked_connect_without_caller_signal(monkeypatch):
+    started = threading.Event()
+    connection = _Connection(started=started)
+    data_socket, peer = socket.socketpair()
+    _install_connection(monkeypatch, connection, data_socket)
+    session = _session()
+    thread, outcome = _run_connect(session)
+
+    try:
+        assert started.wait(1.0)
+        before = time.monotonic()
+        session.quiesce_for_close()
+        thread.join(1.0)
+        elapsed = time.monotonic() - before
+
+        assert not thread.is_alive()
+        assert elapsed < 0.25
+        assert isinstance(outcome.get("error"), SessionClosedError)
+        assert data_socket.fileno() == -1
+        assert session.sock is None
+        assert session.conn is None
+        assert not session._lifecycle_cancel._writers
+    finally:
+        session.abort()
+        thread.join(1.0)
+        peer.close()
+
+
+def test_quiesce_wakes_connect_without_setting_caller_signal(monkeypatch):
+    cancel = ConnectCancellation()
+    started = threading.Event()
+    connection = _Connection(started=started)
+    data_socket, peer = socket.socketpair()
+    _install_connection(monkeypatch, connection, data_socket)
+    session = _session()
+    thread, outcome = _run_connect(session, cancel)
+
+    try:
+        assert started.wait(1.0)
+        session.quiesce_for_close()
+        thread.join(1.0)
+
+        assert not thread.is_alive()
+        assert isinstance(outcome.get("error"), SessionClosedError)
+        assert not cancel.is_set()
+        assert not cancel._writers
+        assert not session._lifecycle_cancel._writers
+    finally:
+        session.abort()
+        thread.join(1.0)
+        peer.close()
+
+
+def test_quiesce_wins_handshake_publication_race(monkeypatch):
+    handshake_entered = threading.Event()
+    release_handshake = threading.Event()
+
+    def pause_at_success():
+        handshake_entered.set()
+        assert release_handshake.wait(1.0)
+
+    connection = _Connection(succeed=True, on_success=pause_at_success)
+    data_socket, peer = socket.socketpair()
+    _install_connection(monkeypatch, connection, data_socket)
+    session = _session()
+    thread, outcome = _run_connect(session)
+
+    try:
+        assert handshake_entered.wait(1.0)
+        session.quiesce_for_close()
+        release_handshake.set()
+        thread.join(1.0)
+
+        assert not thread.is_alive()
+        assert isinstance(outcome.get("error"), SessionClosedError)
+        assert data_socket.fileno() == -1
+        assert session.sock is None
+        assert session.conn is None
+    finally:
+        release_handshake.set()
+        session.abort()
         thread.join(1.0)
         peer.close()
 

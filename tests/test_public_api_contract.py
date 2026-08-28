@@ -176,16 +176,16 @@ def test_dtls_session_keeps_current_consumer_methods():
         "delete",
         "get",
         "join",
+        "abort",
         "pace",
         "ping",
         "post",
+        "quiesce_for_close",
         "refresh_observes",
         "start_reader",
         "subscribe",
     }
     assert expected <= set(dir(DtlsCoapSession))
-    assert "abort" not in DtlsCoapSession.__dict__
-    assert "quiesce_for_close" not in DtlsCoapSession.__dict__
     _assert_compatible_signature(DtlsCoapSession.connect, ["self"])
     connect_timeout = inspect.signature(DtlsCoapSession.connect).parameters[
         "timeout"
@@ -198,6 +198,11 @@ def test_dtls_session_keeps_current_consumer_methods():
     assert connect_cancel.kind is inspect.Parameter.KEYWORD_ONLY
     assert connect_cancel.default is None
     assert callable(ConnectCancellation().set)
+    _assert_compatible_signature(
+        DtlsCoapSession.quiesce_for_close,
+        ["self"],
+    )
+    _assert_compatible_signature(DtlsCoapSession.abort, ["self"])
     _assert_compatible_signature(
         DtlsCoapSession.get,
         [
