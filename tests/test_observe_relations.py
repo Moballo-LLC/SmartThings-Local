@@ -261,6 +261,10 @@ def test_blockwise_refetch_keeps_query_and_callback_kind():
     )
 
     key = ("/mode/vs/0", ("if=oic.if.a",), True)
+    token = b"\x41"
+    session._observe_tokens[token] = key[0]
+    session._observe_queries[token] = key[1]
+    session._legacy_observe_tokens.add(token)
     session._refetch_one(key, 1)
 
     session._blockwise_get.assert_called_once_with(

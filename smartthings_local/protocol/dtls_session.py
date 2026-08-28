@@ -32,6 +32,7 @@ import os
 import socket
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from OpenSSL import SSL
@@ -149,6 +150,7 @@ _REFETCH_TIMEOUT_S = 15.0
 _OBSERVE_SEQUENCE_MODULUS = 1 << 24
 _OBSERVE_SEQUENCE_HALF_RANGE = 1 << 23
 _OBSERVE_SEQUENCE_RESET_S = 128.0
+_MAX_OBSERVE_RELATIONS = 0xFF
 
 
 class _EtagChanged(Exception):
@@ -226,6 +228,49 @@ def _validated_text_options(values, *, name, allow_empty):
             raise ValueError(f'{name} values must be non-empty and bounded')
         result.append(value)
     return tuple(result)
+
+
+def _validated_observe_paths(paths):
+    """Return unique bounded Observe paths and their canonical hrefs."""
+    if isinstance(paths, (str, bytes, bytearray, memoryview)):
+        raise TypeError('paths must be an iterable of path iterables')
+    try:
+        iterator = iter(paths)
+    except TypeError:
+        raise TypeError(
+            'paths must be an iterable of path iterables') from None
+    result = []
+    seen_hrefs = set()
+    for index, path in enumerate(iterator):
+        if index >= _MAX_OBSERVE_RELATIONS:
+            raise ValueError('paths must contain at most 255 paths')
+        normalized = _validated_text_options(
+            path, name='path', allow_empty=False)
+        href = '/' + '/'.join(normalized)
+        if href in seen_hrefs:
+            continue
+        seen_hrefs.add(href)
+        result.append((normalized, href))
+    return tuple(result)
+
+
+def _validated_observe_query_overrides(queries_by_href, target_hrefs):
+    """Validate explicit path-to-query overrides before relation mutation."""
+    if queries_by_href is None:
+        return {}
+    if not isinstance(queries_by_href, Mapping):
+        raise TypeError('queries_by_href must be a mapping or None')
+    if len(queries_by_href) > len(target_hrefs):
+        raise ValueError('queries_by_href contains a non-target href')
+    result = {}
+    for href, query in queries_by_href.items():
+        if not isinstance(href, str):
+            raise TypeError('queries_by_href keys must be href strings')
+        if href not in target_hrefs:
+            raise ValueError('queries_by_href contains a non-target href')
+        result[href] = _validated_text_options(
+            query, name='query', allow_empty=False)
+    return result
 
 
 def _validated_extra_options(extra_options):
@@ -430,6 +475,10 @@ class DtlsCoapSession:
         # this they can collide and one transfer silently absorbs the
         # other's blocks.
         self._state_lock = threading.Lock()
+        # Serialize public relation mutations without holding _state_lock over
+        # network sends. The reader must remain free to dispatch an immediate
+        # registration response while refresh, unsubscribe, or close runs.
+        self._observe_operation_lock = threading.RLock()
         # Randomize MID and token counter starting points so reconnects
         # don't reuse identifiers from previous sessions — Samsung's
         # RT-OCF appears to remember observer state across DTLS
@@ -657,8 +706,6 @@ class DtlsCoapSession:
     def _send_observe_dereg(self, tok, path_segs, query=()):
         """Send a single OBSERVE deregister GET (Observe option = 1)
         on the existing token. Best-effort — caller swallows errors."""
-        if self.conn is None:
-            return
         mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
         for value in query:
@@ -710,6 +757,10 @@ class DtlsCoapSession:
         first so Samsung's RT-OCF cleans up its observer table —
         without this, the per-cert observer state survives DTLS close
         and a quick reconnect with the same tokens silently no-ops."""
+        with self._observe_operation_lock:
+            self._close_orderly()
+
+    def _close_orderly(self):
         # Send dereg for every active observation while the conn is
         # still healthy. Tiny sleep lets the records reach the wire
         # before we shut DTLS down.
@@ -721,6 +772,7 @@ class DtlsCoapSession:
             for tok, href in observations:
                 segs = [s for s in href.split('/') if s]
                 try:
+                    self.pace()
                     self._send_observe_dereg(
                         tok, segs, observe_queries.get(tok, ()))
                 except Exception as e:
@@ -750,18 +802,19 @@ class DtlsCoapSession:
     def abort(self):
         """Immediately stop work and close the established transport."""
         self.quiesce_for_close()
-        with self._lifecycle_lock:
-            sock = self.sock
-            self.sock = None
-            self.conn = None
-            self.dest = None
-            self.endpoint = None
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
-        self._clear_observe_relations()
+        with self._observe_operation_lock:
+            with self._lifecycle_lock:
+                sock = self.sock
+                self.sock = None
+                self.conn = None
+                self.dest = None
+                self.endpoint = None
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self._clear_observe_relations()
 
     # ---- send / receive plumbing -------------------------------------
 
@@ -863,6 +916,31 @@ class DtlsCoapSession:
             self._legacy_observe_tokens.clear()
             self._legacy_observe_mids.clear()
             self._observe_sequences.clear()
+
+    def _observe_relation_active(self, href, query, legacy):
+        """Return whether one confirmed relation still owns this identity."""
+        with self._state_lock:
+            for tok, observed_href in self._observe_tokens.items():
+                if observed_href != href or \
+                        self._observe_queries.get(tok, ()) != query:
+                    continue
+                if legacy:
+                    if tok in self._legacy_observe_tokens:
+                        return True
+                elif tok in self._observe_sequences:
+                    return True
+        return False
+
+    def _discard_refetches_for_hrefs(self, hrefs):
+        """Discard queued work for retired paths; running work self-checks."""
+        hrefs = frozenset(hrefs)
+        if not hrefs:
+            return
+        with self._refetch_cond:
+            for key in tuple(self._refetch_pending):
+                if key[0] in hrefs:
+                    self._refetch_pending.pop(key, None)
+            self._refetch_cond.notify_all()
 
     @staticmethod
     def _observe_sequence_is_fresh(previous, current, received_at):
@@ -980,6 +1058,7 @@ class DtlsCoapSession:
             with self._refetch_cond:
                 self._refetch_pending.clear()
                 self._refetch_cond.notify_all()
+            self._clear_observe_relations()
 
     def _dispatch_coap(self, datagram):
         try:
@@ -1240,6 +1319,8 @@ class DtlsCoapSession:
         """Re-read one href from block 0 and deliver it if it is still
         the freshest thing we know about that resource."""
         href, query, legacy = key
+        if not self._observe_relation_active(href, query, legacy):
+            return
         self.pace()
         segs = [s for s in href.split('/') if s]
         try:
@@ -1263,6 +1344,8 @@ class DtlsCoapSession:
                     "refetch %s tok=%s blocks=%d bytes=%d superseded",
                     href, tok.hex(), blocks, len(payload))
                 return
+        if not self._observe_relation_active(href, query, legacy):
+            return
         self._log_refetch("refetch %s tok=%s blocks=%d bytes=%d ok",
                           href, tok.hex(), blocks, len(payload))
         cb = (
@@ -1907,51 +1990,108 @@ class DtlsCoapSession:
         self._send_dgram(build_coap(TYPE_CON, 0, mid, b'', []))
         return mid
 
-    def refresh_observes(self, paths):
-        """Drop all current OBSERVE registrations and re-subscribe to
-        the given paths. Used as a periodic safety net — CoAP OBSERVE
-        has no built-in TTL but Samsung's RT-OCF can age out its
-        observer table during cloud blips even while the DTLS session
-        stays healthy. Without this, internet recovery on a still-
-        reachable device leaves push permanently dead.
+    def refresh_observes(self, paths, *, queries_by_href=None):
+        """Replace only the requested Observe paths and report send results.
 
-        Best-effort: dereg failures are logged and we still bind fresh
-        tokens via subscribe. Brief race window where a notify on the
-        old token gets dropped as 'stale' — acceptable for a 6h-scale
-        safety net."""
+        Existing query-separated relations are preserved unless an exact href
+        is present in ``queries_by_href``. Deregistration is best-effort; each
+        old local relation is retired even when its send fails. A successful
+        href means its replacement registration datagram was sent, not that a
+        later response has confirmed the relation.
+        """
+        with self._observe_operation_lock:
+            return self._refresh_observes_locked(
+                paths, queries_by_href=queries_by_href)
+
+    def _refresh_observes_locked(self, paths, *, queries_by_href=None):
         self._check_live()
-        # Paced, unlike the teardown dereg in close(): that one wants out
-        # quickly and the session is finished either way, while this one
-        # runs against a session that has to keep working afterwards, and an
-        # unpaced OBSERVE burst is what wedges an appliance until something
-        # forces a new session (LocalThings#396). The subscribe sweep below
-        # needs nothing here — subscribe() paces its own send.
-        normalized_paths = tuple(tuple(path) for path in paths)
+        normalized_paths = _validated_observe_paths(paths)
+        target_hrefs = frozenset(href for _path, href in normalized_paths)
+        query_overrides = _validated_observe_query_overrides(
+            queries_by_href, target_hrefs)
+
+        # Snapshot every target before any network work so query preservation
+        # and the mutation set describe the same relation generation.
         with self._state_lock:
-            observations = tuple(self._observe_tokens.items())
-            observe_queries = dict(self._observe_queries)
-        queries_by_href = {}
-        for tok, href in observations:
-            queries_by_href.setdefault(href, []).append(
-                observe_queries.get(tok, ()))
-        for tok, href in observations:
-            segs = [s for s in href.split('/') if s]
+            observations = tuple(
+                (tok, href, self._observe_queries.get(tok, ()))
+                for tok, href in self._observe_tokens.items()
+                if href in target_hrefs
+            )
+
+        preserved_queries = {}
+        for _tok, href, query in observations:
+            queries = preserved_queries.setdefault(href, [])
+            if query not in queries:
+                queries.append(query)
+
+        for tok, href, query in observations:
             try:
                 self.pace()
                 self._send_observe_dereg(
-                    tok, segs, observe_queries.get(tok, ()))
+                    tok, [segment for segment in href.split('/') if segment],
+                    query)
             except Exception as e:
                 logger.warning("refresh dereg %s: %s", href, e)
-            with self._state_lock:
-                self._retire_observe_token_locked(tok)
-        for path in normalized_paths:
-            href = '/' + '/'.join(path)
-            queries = queries_by_href.get(href, [()])
+            finally:
+                with self._state_lock:
+                    self._retire_observe_token_locked(tok)
+        self._discard_refetches_for_hrefs(target_hrefs)
+
+        successful = []
+        successful_hrefs = set()
+        failures = 0
+        for path, href in normalized_paths:
+            queries = (
+                (query_overrides[href],)
+                if href in query_overrides
+                else tuple(preserved_queries.get(href, ())) or ((),)
+            )
             for query in queries:
                 try:
-                    self.subscribe(list(path), query=query)
+                    # subscribe() owns pacing for its registration send.
+                    self.subscribe(path, query=query)
                 except Exception as e:
-                    logger.warning("refresh subscribe %s: %s", path, e)
+                    failures += 1
+                    logger.warning("refresh subscribe %s: %s", href, e)
+                else:
+                    if href not in successful_hrefs:
+                        successful.append(href)
+                        successful_hrefs.add(href)
+        return tuple(successful), failures
+
+    def unsubscribe(self, path_segs):
+        """Deregister and retire every active relation for one exact path."""
+        with self._observe_operation_lock:
+            return self._unsubscribe_locked(path_segs)
+
+    def _unsubscribe_locked(self, path_segs):
+        self._check_live()
+        path_segs = _validated_text_options(
+            path_segs, name='path_segs', allow_empty=False)
+        href = '/' + '/'.join(path_segs)
+        with self._state_lock:
+            observations = tuple(
+                (tok, self._observe_queries.get(tok, ()))
+                for tok, observed_href in self._observe_tokens.items()
+                if observed_href == href
+            )
+
+        first_error = None
+        for tok, query in observations:
+            try:
+                self.pace()
+                self._send_observe_dereg(tok, path_segs, query)
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+            finally:
+                with self._state_lock:
+                    self._retire_observe_token_locked(tok)
+        self._discard_refetches_for_hrefs((href,))
+        if first_error is not None:
+            raise first_error
+        return len(observations)
 
     def subscribe(self, path_segs, *, query=()):
         """Register an OBSERVE on the given path. The initial 2.05
@@ -1960,6 +2100,10 @@ class DtlsCoapSession:
 
         Returns the token used (in case the caller wants to deregister
         later)."""
+        with self._observe_operation_lock:
+            return self._subscribe_locked(path_segs, query=query)
+
+    def _subscribe_locked(self, path_segs, *, query=()):
         self._check_live()
         path_segs = _validated_text_options(
             path_segs, name='path_segs', allow_empty=False)
