@@ -5,17 +5,24 @@ from __future__ import annotations
 import pytest
 
 import smartthings_local.protocol.dtls_session as dtls_session
+from smartthings_local.errors import (
+    SessionClosedError,
+    SessionResetError,
+    SessionTimeoutError,
+)
 from smartthings_local.protocol.coap import (
     ACCEPT,
     BLOCK1,
     BLOCK2,
     CONTENT_FORMAT,
+    METHOD_DELETE,
     METHOD_GET,
     METHOD_POST,
     OBSERVE,
     SIZE1,
     SIZE2,
     TYPE_ACK,
+    TYPE_RST,
     URI_PATH,
     URI_QUERY,
     block_value,
@@ -185,6 +192,109 @@ def test_post_retransmission_keeps_query_and_extension_wire_bytes(monkeypatch):
     ]
     assert _VERSION_OPTION in requests[1][4]
     assert _ROUTING_OPTION in requests[1][4]
+
+
+def test_delete_encodes_queries_and_extensions_without_a_payload():
+    session, requests = _session(lambda request, _number: _response(request))
+
+    assert session.delete(
+        ["oic", "sec", "cred"],
+        query=("subjectuuid=peer",),
+        extra_options=(_ROUTING_OPTION,),
+    ) == (0x45, b"ok")
+
+    assert len(requests) == 1
+    _mtype, code, _mid, _token, options, payload = requests[0]
+    assert code == METHOD_DELETE
+    assert payload == b""
+    assert [value for number, value in options if number == URI_QUERY] == [
+        b"subjectuuid=peer"
+    ]
+    assert not [value for number, value in options if number == CONTENT_FORMAT]
+    assert _ROUTING_OPTION in options
+
+
+def test_delete_is_paced_before_send():
+    session, requests = _session(lambda request, _number: _response(request))
+    order = []
+
+    session.pace = lambda: order.append("pace")
+    original_send = session._send_dgram
+
+    def send(datagram):
+        order.append("send")
+        original_send(datagram)
+
+    session._send_dgram = send
+
+    assert session.delete(["resource"]) == (0x45, b"ok")
+    assert order == ["pace", "send"]
+    assert len(requests) == 1
+
+
+def test_delete_timeout_retires_its_pending_exchange():
+    session, requests = _session(lambda _request, _number: None)
+
+    with pytest.raises(SessionTimeoutError):
+        session.delete(["resource"], timeout=0)
+
+    assert len(requests) == 1
+    assert session._pending == {}
+    assert session._pending_mids == {}
+
+
+def test_delete_reset_uses_the_shared_mid_registry():
+    def reset(request, _request_number):
+        _mtype, _code, mid, _token, _options, _payload = request
+        return build_coap(TYPE_RST, 0, mid, b"", ())
+
+    session, requests = _session(reset)
+
+    with pytest.raises(SessionResetError):
+        session.delete(["resource"])
+
+    assert len(requests) == 1
+    assert session._pending == {}
+    assert session._pending_mids == {}
+
+
+def test_delete_fails_fast_when_the_reader_dies_after_send():
+    session, requests = _session(lambda _request, _number: None)
+    session._reader_thread = object()
+    session._reader_running.set()
+    send = session._send_dgram
+
+    def send_then_stop_reader(datagram):
+        send(datagram)
+        session._reader_running.clear()
+
+    session._send_dgram = send_then_stop_reader
+
+    with pytest.raises(SessionClosedError):
+        session.delete(["resource"])
+
+    assert len(requests) == 1
+    assert session._pending == {}
+    assert session._pending_mids == {}
+
+
+def test_delete_keeps_a_response_dispatched_before_reader_teardown():
+    session, requests = _session(lambda request, _number: _response(request))
+    session._reader_thread = object()
+    session._reader_running.set()
+    send = session._send_dgram
+
+    def send_then_stop_reader(datagram):
+        send(datagram)
+        session._reader_running.clear()
+        session._close_pending_requests()
+
+    session._send_dgram = send_then_stop_reader
+
+    assert session.delete(["resource"]) == (0x45, b"ok")
+    assert len(requests) == 1
+    assert session._pending == {}
+    assert session._pending_mids == {}
 
 
 @pytest.mark.parametrize(
