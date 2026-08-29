@@ -12,7 +12,6 @@ from smartthings_local.protocol.coap import (
     BLOCK2,
     OBSERVE,
     TYPE_ACK,
-    TYPE_CON,
     TYPE_NON,
     URI_QUERY,
     block_value,
@@ -71,7 +70,7 @@ def test_subscribe_registers_path_and_query_before_immediate_response():
     def send(datagram):
         request = parse_coap(datagram)
         requests.append(request)
-        _mtype, _code, mid, token, options, _payload = request
+        _mtype, _code, mid, token, _options, _payload = request
         assert session._observe_tokens[token] == "/mode/vs/0"
         assert session._observe_queries[token] == (
             "if=oic.if.a",
@@ -122,8 +121,12 @@ def test_plain_initial_response_needs_different_mid_to_confirm_legacy():
     _notify(session, token, 10, b"initial-retransmit")
 
     assert pending == ["/doors/vs/0"]
-    assert delivered == []
+    assert delivered == [
+        ("standard", "/doors/vs/0", b"initial"),
+    ]
+    assert session._observe_plain_response_mids[token] == 10
     assert token not in session._legacy_observe_tokens
+    assert token not in session._observe_sequences
 
     _notify(session, token, 11, b"changed")
     _notify(session, token, 11, b"changed-retransmit")
@@ -131,6 +134,7 @@ def test_plain_initial_response_needs_different_mid_to_confirm_legacy():
 
     assert token in session._legacy_observe_tokens
     assert delivered == [
+        ("standard", "/doors/vs/0", b"initial"),
         ("legacy", "/doors/vs/0", b"changed"),
         ("legacy", "/doors/vs/0", b"changed-again"),
     ]
@@ -147,7 +151,87 @@ def test_legacy_notification_falls_back_to_main_callback():
     _notify(session, token, 20, b"initial")
     _notify(session, token, 21, b"changed")
 
-    assert delivered == [("/doors/vs/0", b"changed")]
+    assert delivered == [
+        ("/doors/vs/0", b"initial"),
+        ("/doors/vs/0", b"changed"),
+    ]
+
+
+def test_probationary_blockwise_initial_queues_refetch_without_partial_delivery():
+    delivered = []
+    pending = []
+    session = _session(
+        on_notification=lambda href, payload: delivered.append((href, payload)),
+        on_observe_pending=pending.append,
+    )
+    session._send_dgram = Mock()
+    session._queue_refetch = Mock()
+    token = session.subscribe(
+        ["mode", "vs", "0"], query=("if=oic.if.a",)
+    )
+
+    _notify(
+        session,
+        token,
+        10,
+        b"partial",
+        options=((BLOCK2, block_value(0, 1, 6)),),
+    )
+
+    assert pending == ["/mode/vs/0"]
+    assert delivered == []
+    session._queue_refetch.assert_called_once_with(
+        "/mode/vs/0",
+        ("if=oic.if.a",),
+        legacy=False,
+    )
+
+
+def test_pending_callback_can_retire_relation_before_initial_delivery():
+    delivered = []
+    holder = {}
+
+    def retire(_href):
+        with holder["session"]._state_lock:
+            holder["session"]._retire_observe_token_locked(holder["token"])
+
+    session = _session(
+        on_notification=lambda href, payload: delivered.append((href, payload)),
+        on_observe_pending=retire,
+    )
+    holder["session"] = session
+    session._send_dgram = Mock()
+    holder["token"] = session.subscribe(["mode", "vs", "0"])
+
+    _notify(session, holder["token"], 10, b"initial")
+
+    assert delivered == []
+    assert holder["token"] not in session._observe_tokens
+
+
+def test_probationary_blockwise_representation_is_refetched_before_delivery():
+    delivered = []
+    session = _session(
+        on_notification=lambda href, payload: delivered.append((href, payload))
+    )
+    session._blockwise_get = Mock(
+        return_value=(0x45, b"complete", 2, b"fresh")
+    )
+    token = b"\x41"
+    href = "/mode/vs/0"
+    query = ("if=oic.if.a",)
+    session._observe_tokens[token] = href
+    session._observe_queries[token] = query
+    session._observe_plain_response_mids[token] = 10
+
+    session._refetch_one((href, query, False), 1)
+
+    session._blockwise_get.assert_called_once_with(
+        ["mode", "vs", "0"],
+        query,
+        dtls_session._REFETCH_TIMEOUT_S,
+    )
+    assert delivered == [(href, b"complete")]
 
 
 def test_rejected_observe_retires_every_relation_index():

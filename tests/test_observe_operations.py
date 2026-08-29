@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from smartthings_local.errors import EndpointError
+from smartthings_local.errors import EndpointError, SessionClosedError
 from smartthings_local.protocol.coap import (
     OBSERVE,
     URI_PATH,
@@ -345,18 +345,64 @@ def test_normal_close_paces_every_exact_deregister_and_clears_state(
     assert session._observe_sequences == {}
 
 
-def test_quiesced_close_skips_deregister_pacing():
+def test_quiesced_close_paces_every_deregister_for_orderly_teardown():
     session = _session()
     session.sock = _Socket()
-    _add_relation(session, ["mode", "vs", "0"])
+    token = _add_relation(session, ["mode", "vs", "0"])
     session.pace = Mock()
+    session._pace_orderly_close = Mock()
     session._send_observe_dereg = Mock()
 
     session.quiesce_for_close()
     session.close()
 
     session.pace.assert_not_called()
-    session._send_observe_dereg.assert_not_called()
+    session._pace_orderly_close.assert_called_once_with()
+    session._send_observe_dereg.assert_called_once_with(
+        token,
+        ["mode", "vs", "0"],
+        (),
+    )
+
+
+def test_quiesced_close_preserves_existing_send_override_signature():
+    session = _session()
+    session.sock = _Socket()
+    token = _add_relation(session, ["mode", "vs", "0"])
+    sent = []
+    session._send_dgram = sent.append
+    session._pace_orderly_close = Mock()
+
+    session.quiesce_for_close()
+    session.close()
+
+    assert len(sent) == 1
+    assert parse_coap(sent[0])[3] == token
+
+
+def test_orderly_close_send_permission_is_thread_local():
+    session = _session()
+    session.quiesce_for_close()
+    outcomes = []
+
+    def try_application_send():
+        try:
+            session._send_dgram(b"application request")
+        except Exception as error:  # noqa: BLE001 - captured for assertion
+            outcomes.append(error)
+
+    def during_teardown_send(_token, _path, _query):
+        thread = threading.Thread(target=try_application_send)
+        thread.start()
+        thread.join()
+
+    session._send_observe_dereg = during_teardown_send
+    session._send_observe_dereg_after_quiesce(
+        b"o", ["mode", "vs", "0"], ()
+    )
+
+    assert len(outcomes) == 1
+    assert isinstance(outcomes[0], SessionClosedError)
 
 
 def test_reader_exit_clears_all_relation_state():

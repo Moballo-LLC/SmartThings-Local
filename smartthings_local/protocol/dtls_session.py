@@ -469,6 +469,11 @@ class DtlsCoapSession:
         self._lifecycle_lock = threading.Lock()
 
         self._send_lock = threading.Lock()
+        # Only the thread performing orderly close may send an Observe
+        # deregistration after terminal quiescence. A thread-local exception
+        # keeps concurrent application senders blocked without changing the
+        # existing private send-hook signatures used by test/session adapters.
+        self._orderly_close_send_thread_id = None
         # Guards the MID/token counters and pending-request registries.
         # The refetch worker makes the session its own second concurrent
         # get() caller, so two threads can mint tokens at once; without
@@ -532,6 +537,18 @@ class DtlsCoapSession:
         remaining = self._min_req_interval - (time.monotonic() - self._last_send_ts)
         if remaining > 0:
             self._stop.wait(remaining)
+
+    def _pace_orderly_close(self) -> None:
+        """Honor request spacing after terminal quiescence.
+
+        ``quiesce_for_close()`` sets ``_stop`` so ordinary paced work wakes
+        immediately.  A later orderly close still has to space its explicit
+        Observe deregistrations, so this teardown-only path cannot wait on the
+        already-set event.
+        """
+        remaining = self._min_req_interval - (time.monotonic() - self._last_send_ts)
+        if remaining > 0:
+            time.sleep(remaining)
 
     # ---- lifecycle ---------------------------------------------------
 
@@ -712,8 +729,16 @@ class DtlsCoapSession:
             opts.append((URI_QUERY, value.encode()))
         opts.append((OBSERVE, OBSERVE_DEREGISTER))
         opts.append((ACCEPT, CF_CBOR))
-        self._send_dgram(
-            build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+        self._send_dgram(build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+
+    def _send_observe_dereg_after_quiesce(self, tok, path_segs, query=()):
+        """Permit one orderly-close deregistration on the closing thread."""
+        previous = self._orderly_close_send_thread_id
+        self._orderly_close_send_thread_id = threading.get_ident()
+        try:
+            self._send_observe_dereg(tok, path_segs, query)
+        finally:
+            self._orderly_close_send_thread_id = previous
 
     @staticmethod
     def _send_close_notify(connection, sock):
@@ -764,17 +789,25 @@ class DtlsCoapSession:
         # Send dereg for every active observation while the conn is
         # still healthy. Tiny sleep lets the records reach the wire
         # before we shut DTLS down.
-        if (not self._lifecycle_cancel.is_set() and self.conn is not None
-                and self._observe_tokens):
+        if self.conn is not None and self._observe_tokens:
+            quiesced = self._lifecycle_cancel.is_set()
             with self._state_lock:
                 observations = tuple(self._observe_tokens.items())
                 observe_queries = dict(self._observe_queries)
             for tok, href in observations:
                 segs = [s for s in href.split('/') if s]
                 try:
-                    self.pace()
-                    self._send_observe_dereg(
-                        tok, segs, observe_queries.get(tok, ()))
+                    if quiesced:
+                        self._pace_orderly_close()
+                        self._send_observe_dereg_after_quiesce(
+                            tok,
+                            segs,
+                            observe_queries.get(tok, ()),
+                        )
+                    else:
+                        self.pace()
+                        self._send_observe_dereg(
+                            tok, segs, observe_queries.get(tok, ()))
                 except Exception as e:
                     logger.warning("dereg %s: %s", href, e)
             time.sleep(0.1)
@@ -918,7 +951,7 @@ class DtlsCoapSession:
             self._observe_sequences.clear()
 
     def _observe_relation_active(self, href, query, legacy):
-        """Return whether one confirmed relation still owns this identity."""
+        """Return whether one relation still owns this callback identity."""
         with self._state_lock:
             for tok, observed_href in self._observe_tokens.items():
                 if observed_href != href or \
@@ -927,7 +960,14 @@ class DtlsCoapSession:
                 if legacy:
                     if tok in self._legacy_observe_tokens:
                         return True
-                elif tok in self._observe_sequences:
+                elif tok in self._observe_sequences or (
+                        tok in self._observe_plain_response_mids
+                        and tok not in self._legacy_observe_tokens):
+                    # A probationary optionless response is not proof of an
+                    # Observe relation, but its complete representation still
+                    # belongs on the ordinary notification callback. Keep a
+                    # Block2 refetch alive until the token is retired or later
+                    # proves the legacy relation.
                     return True
         return False
 
@@ -955,9 +995,17 @@ class DtlsCoapSession:
 
     def _send_dgram(self, datagram):
         """Send a CoAP datagram. Holds the send lock for the
-        BIO-drain so two writers can't interleave records."""
+        BIO-drain so two writers can't interleave records.
+
+        The orderly-close deregistration helper grants only its calling thread
+        a teardown send after application workers have joined. All ordinary
+        request paths remain blocked once terminal quiescence begins.
+        """
         with self._send_lock:
-            if self._lifecycle_cancel.is_set() or self.conn is None:
+            orderly_close_send = (
+                self._orderly_close_send_thread_id == threading.get_ident())
+            if (self._lifecycle_cancel.is_set() and not orderly_close_send) or \
+                    self.conn is None:
                 raise SessionClosedError()
             send_failed = False
             try:
@@ -1058,7 +1106,12 @@ class DtlsCoapSession:
             with self._refetch_cond:
                 self._refetch_pending.clear()
                 self._refetch_cond.notify_all()
-            self._clear_observe_relations()
+            # Two-phase shutdown retains relation metadata for close(), which
+            # runs after application workers have joined and sends the paced
+            # deregistration sweep. Unexpected reader death has no later
+            # orderly phase and must still retire everything immediately.
+            if not self._lifecycle_cancel.is_set():
+                self._clear_observe_relations()
 
     def _dispatch_coap(self, datagram):
         try:
@@ -1221,7 +1274,14 @@ class DtlsCoapSession:
                         except Exception as e:
                             logger.debug(
                                 "observe pending callback %s: %s", href, e)
-                    return
+                    with self._state_lock:
+                        if self._observe_tokens.get(tok) != href or \
+                                self._observe_queries.get(tok, ()) != \
+                                observe_query or \
+                                self._observe_plain_response_mids.get(tok) != \
+                                mid or tok in self._legacy_observe_tokens or \
+                                tok in self._observe_sequences:
+                            return
             # RFC 7959 §2.6: a notification carries only the first block
             # of the representation. Handing the callback a partial CBOR
             # buffer is what #39 was about, so anything with M=1 (or a
