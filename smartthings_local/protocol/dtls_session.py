@@ -261,7 +261,8 @@ class ConnectCancellation:
 
     Each active connection attempt receives its own wake socket. ``set()``
     makes every subscribed socket readable immediately, without a polling
-    thread or a session-level abort API.
+    thread. Session shutdown shares that wake path without changing a
+    caller-supplied signal.
     """
 
     __slots__ = ("_is_set", "_lock", "_writers")
@@ -291,20 +292,33 @@ class ConnectCancellation:
     def _subscribe(self) -> tuple[socket.socket, socket.socket]:
         reader, writer = socket.socketpair()
         reader.setblocking(False)
+        try:
+            self._subscribe_writer(writer)
+        except Exception:
+            reader.close()
+            writer.close()
+            raise
+        return reader, writer
+
+    def _subscribe_writer(self, writer: socket.socket) -> None:
+        """Attach an existing wake writer without taking ownership of it."""
         with self._lock:
             self._writers.add(writer)
             if self._is_set:
                 writer.send(b"\0")
-        return reader, writer
+
+    def _unsubscribe_writer(self, writer: socket.socket) -> bool:
+        """Detach a shared wake writer and report cancellation state."""
+        with self._lock:
+            self._writers.discard(writer)
+            return self._is_set
 
     def _unsubscribe(
         self,
         reader: socket.socket,
         writer: socket.socket,
     ) -> bool:
-        with self._lock:
-            self._writers.discard(writer)
-            interrupted = self._is_set
+        interrupted = self._unsubscribe_writer(writer)
         reader.close()
         writer.close()
         return interrupted
@@ -389,6 +403,13 @@ class DtlsCoapSession:
         self.dest = None
         self.endpoint = None
 
+        # Terminal session shutdown has its own wake signal so
+        # quiesce_for_close() can interrupt connect() even when the caller did
+        # not supply a ConnectCancellation. The lifecycle lock makes handshake
+        # publication atomic with that one-way transition.
+        self._lifecycle_cancel = ConnectCancellation()
+        self._lifecycle_lock = threading.Lock()
+
         self._send_lock = threading.Lock()
         # Guards the MID/token counters and pending-request registries.
         # The refetch worker makes the session its own second concurrent
@@ -461,18 +482,21 @@ class DtlsCoapSession:
             timeout, self.HANDSHAKE_TIMEOUT_S)
         if cancel is not None and not isinstance(cancel, ConnectCancellation):
             raise TypeError("cancel must be a ConnectCancellation or None")
-        if cancel is not None and cancel.is_set():
+        if self._lifecycle_cancel.is_set() or \
+                (cancel is not None and cancel.is_set()):
             raise SessionClosedError()
         deadline = time.monotonic() + handshake_timeout
         ctx = SSL.Context(SSL.DTLS_METHOD)
         self.auth.configure_context(ctx)
-        if cancel is not None and cancel.is_set():
+        if self._lifecycle_cancel.is_set() or \
+                (cancel is not None and cancel.is_set()):
             raise SessionClosedError()
 
         conn = SSL.Connection(ctx, None)
         conn.set_connect_state()
         conn.set_ciphertext_mtu(self.mtu)
-        if cancel is not None and cancel.is_set():
+        if self._lifecycle_cancel.is_set() or \
+                (cancel is not None and cancel.is_set()):
             raise SessionClosedError()
 
         remaining = deadline - time.monotonic()
@@ -486,18 +510,32 @@ class DtlsCoapSession:
             timeout=min(_HANDSHAKE_POLL_S, remaining),
         )
         dest = endpoint.sockaddr
-        if cancel is not None and cancel.is_set():
+        if self._lifecycle_cancel.is_set() or \
+                (cancel is not None and cancel.is_set()):
             sock.close()
             raise SessionClosedError()
 
         wake_subscription = None
         subscription_failed = False
-        if cancel is not None:
+        wake_owner = cancel or self._lifecycle_cancel
+        lifecycle_writer_shared = cancel is not None
+        # Production endpoints are real sockets and can share select() with
+        # the wake socket. Retain the timeout-driven path for structural socket
+        # adapters that intentionally expose no file descriptor.
+        if callable(getattr(sock, "fileno", None)):
             try:
-                wake_subscription = cancel._subscribe()
+                wake_subscription = wake_owner._subscribe()
+                if lifecycle_writer_shared:
+                    self._lifecycle_cancel._subscribe_writer(
+                        wake_subscription[1])
             except OSError:
                 subscription_failed = True
         if subscription_failed:
+            if wake_subscription is not None:
+                if lifecycle_writer_shared:
+                    self._lifecycle_cancel._unsubscribe_writer(
+                        wake_subscription[1])
+                wake_owner._unsubscribe(*wake_subscription)
             sock.close()
             raise SessionError() from OSError(
                 "connection cancellation setup failed"
@@ -528,7 +566,13 @@ class DtlsCoapSession:
                 io_failed = True
         finally:
             if wake_subscription is not None:
-                interrupted = cancel._unsubscribe(*wake_subscription)
+                if lifecycle_writer_shared:
+                    interrupted = self._lifecycle_cancel._unsubscribe_writer(
+                        wake_subscription[1])
+                interrupted = (
+                    wake_owner._unsubscribe(*wake_subscription)
+                    or interrupted
+                )
         if cancelled or (interrupted and not completed):
             sock.close()
             raise SessionClosedError()
@@ -542,21 +586,27 @@ class DtlsCoapSession:
             sock.close()
             raise SessionTimeoutError()
 
-        self.sock = sock
-        self.conn = conn
-        self.dest = dest
-        self.endpoint = endpoint
-        self._stop.clear()
+        with self._lifecycle_lock:
+            if self._lifecycle_cancel.is_set():
+                sock.close()
+                raise SessionClosedError()
+            self.sock = sock
+            self.conn = conn
+            self.dest = dest
+            self.endpoint = endpoint
+            self._stop.clear()
 
     def start_reader(self):
         """Spawn the reader thread. Must be called after connect()."""
-        if self.sock is None:
-            raise RuntimeError("connect() before start_reader()")
-        self._reader_running.set()
-        t = threading.Thread(target=self._reader_loop,
-                             daemon=True, name='dtls-reader')
-        t.start()
-        self._reader_thread = t
+        with self._lifecycle_lock:
+            if self.sock is None:
+                raise RuntimeError("connect() before start_reader()")
+            self._check_live()
+            self._reader_running.set()
+            t = threading.Thread(target=self._reader_loop,
+                                 daemon=True, name='dtls-reader')
+            t.start()
+            self._reader_thread = t
 
     def _check_live(self):
         """Raise if the session cannot carry a request. A dead reader is
@@ -567,7 +617,7 @@ class DtlsCoapSession:
         Callers that never start a reader (config-flow style) keep the old
         behaviour — only the conn check applies while _reader_thread is
         None."""
-        if self.conn is None:
+        if self._lifecycle_cancel.is_set() or self.conn is None:
             raise SessionClosedError()
         if self._reader_thread is not None and \
                 not self._reader_running.is_set():
@@ -592,6 +642,43 @@ class DtlsCoapSession:
         self._send_dgram(
             build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
 
+    @staticmethod
+    def _send_close_notify(connection, sock):
+        """Best-effort flush the encrypted DTLS close-notify record."""
+        try:
+            connection.shutdown()
+        except (SSL.WantReadError, SSL.ZeroReturnError):
+            pass
+        except Exception:
+            pass
+        try:
+            while True:
+                try:
+                    outbound = connection.bio_read(65535)
+                except SSL.WantReadError:
+                    break
+                if not outbound:
+                    break
+                for record in _split_dtls(outbound):
+                    if sock.send(record) != len(record):
+                        raise OSError('incomplete UDP send')
+        except Exception:
+            pass
+
+    def quiesce_for_close(self):
+        """Stop new work while retaining an established socket for close()."""
+        with self._lifecycle_lock:
+            self._lifecycle_cancel.set()
+            # Synchronize with an in-progress application send. Once this lock
+            # is released, _send_dgram() observes lifecycle cancellation before
+            # touching DTLS.
+            with self._send_lock:
+                self._stop.set()
+        with self._refetch_cond:
+            self._refetch_pending.clear()
+            self._refetch_cond.notify_all()
+        self._close_pending_requests()
+
     def close(self):
         """Tear down session. Sends best-effort OBSERVE deregisters
         first so Samsung's RT-OCF cleans up its observer table —
@@ -600,7 +687,8 @@ class DtlsCoapSession:
         # Send dereg for every active observation while the conn is
         # still healthy. Tiny sleep lets the records reach the wire
         # before we shut DTLS down.
-        if self.conn is not None and self._observe_tokens:
+        if (not self._lifecycle_cancel.is_set() and self.conn is not None
+                and self._observe_tokens):
             for tok, href in list(self._observe_tokens.items()):
                 segs = [s for s in href.split('/') if s]
                 try:
@@ -609,17 +697,10 @@ class DtlsCoapSession:
                     logger.warning("dereg %s: %s", href, e)
             time.sleep(0.1)
 
-        self._stop.set()
-        # Wake the refetch worker so it sees _stop instead of sitting on
-        # its condition for up to a second after the socket is gone.
-        with self._refetch_cond:
-            self._refetch_pending.clear()
-            self._refetch_cond.notify_all()
-        if self.conn is not None:
-            try:
-                self.conn.shutdown()
-            except Exception:
-                pass
+        self.quiesce_for_close()
+        with self._send_lock:
+            if self.conn is not None and self.sock is not None:
+                self._send_close_notify(self.conn, self.sock)
         if self.sock is not None:
             try:
                 self.sock.close()
@@ -629,12 +710,30 @@ class DtlsCoapSession:
         # that passed its entry check just before close() will then fail the
         # post-registration liveness check instead of registering after the
         # drain and waiting against a session that can no longer respond.
-        self.sock = None
-        self.conn = None
-        self.dest = None
-        self.endpoint = None
-        self._close_pending_requests()
-        self._observe_tokens.clear()
+        with self._lifecycle_lock:
+            self.sock = None
+            self.conn = None
+            self.dest = None
+            self.endpoint = None
+        with self._state_lock:
+            self._observe_tokens.clear()
+
+    def abort(self):
+        """Immediately stop work and close the established transport."""
+        self.quiesce_for_close()
+        with self._lifecycle_lock:
+            sock = self.sock
+            self.sock = None
+            self.conn = None
+            self.dest = None
+            self.endpoint = None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        with self._state_lock:
+            self._observe_tokens.clear()
 
     # ---- send / receive plumbing -------------------------------------
 
@@ -726,7 +825,7 @@ class DtlsCoapSession:
         """Send a CoAP datagram. Holds the send lock for the
         BIO-drain so two writers can't interleave records."""
         with self._send_lock:
-            if self.conn is None:
+            if self._lifecycle_cancel.is_set() or self.conn is None:
                 raise SessionClosedError()
             send_failed = False
             try:
@@ -1718,11 +1817,17 @@ class DtlsCoapSession:
         # Register the token BEFORE sending — otherwise the device
         # could respond between send() and the dict insert, and the
         # reader thread would drop the initial 2.05 as "stale".
-        self._observe_tokens[tok] = href
+        with self._state_lock:
+            self._observe_tokens[tok] = href
         mid = self._next_mid()
         opts = [(URI_PATH, s.encode()) for s in path_segs]
         opts.append((OBSERVE, OBSERVE_REGISTER))
         opts.append((ACCEPT, CF_CBOR))
-        self._send_dgram(
-            build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+        try:
+            self._send_dgram(
+                build_coap(TYPE_CON, METHOD_GET, mid, tok, opts))
+        except Exception:
+            with self._state_lock:
+                self._observe_tokens.pop(tok, None)
+            raise
         return tok

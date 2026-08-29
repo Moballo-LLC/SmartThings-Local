@@ -102,8 +102,26 @@ sess.connect(timeout=8.0, cancel=cancel_connect)
 ```
 
 Setting the signal stops subscribed connection attempts and closes their
-temporary UDP sockets. It does not alter an already established session or add
-new session lifecycle methods. Interrupted attempts raise `SessionClosedError`.
+temporary UDP sockets. It does not alter an already established session.
+Interrupted attempts raise `SessionClosedError`.
+
+Hosts that stop network work before their blocking executor drains can use the
+session's two-phase shutdown. `quiesce_for_close()` is terminal: it interrupts
+an in-progress handshake, wakes pending requests and notification refetches,
+and rejects new work while retaining an established DTLS socket. A subsequent
+`close()` flushes the authenticated close-notify record before closing that
+socket:
+
+```python
+sess.quiesce_for_close()  # safe from the host's early shutdown phase
+# Later, after session workers have joined:
+sess.close()
+```
+
+Use `abort()` when orderly shutdown is impossible. It performs the same
+terminal wakeup but closes the established socket immediately, without waiting
+for close-notify. All three methods are idempotent; a quiesced or aborted
+session cannot be connected again.
 
 Reads retransmit each Block2 request; writes send once. Where a lost write
 has been shown to be the cause rather than a device that is simply refusing
