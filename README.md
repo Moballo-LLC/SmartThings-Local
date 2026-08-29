@@ -192,6 +192,61 @@ messages = decoder.feed(received_chunk)
 The module deliberately does not open a TCP/TLS/Bluetooth connection, choose a
 carrier, or perform setup and ownership operations. Those remain caller policy.
 
+## BLE OCF framing
+
+`smartthings_local.protocol.ble_ocf` provides the pure fragmentation layer
+used by IoTivity's GATT transport. The two-byte header carries a start flag,
+source and destination virtual ports, and a secure flag. A start frame also
+carries the PDU's four-byte big-endian total length. The format and full-frame
+fragmentation behavior are documented in Samsung's public IoTivity sources:
+[`cafragmentation.h`](https://github.com/Samsung/TizenRT/blob/0df9b54dfd35d9aaba2c16eb2ef9f4b4b6a5f545/external/iotivity/iotivity_1.2-rel/resource/csdk/connectivity/inc/cafragmentation.h),
+[`cafragmentation.c`](https://github.com/Samsung/TizenRT/blob/0df9b54dfd35d9aaba2c16eb2ef9f4b4b6a5f545/external/iotivity/iotivity_1.2-rel/resource/csdk/connectivity/src/adapter_util/cafragmentation.c),
+and the adapter's
+[`caleadapter.c`](https://github.com/Samsung/TizenRT/blob/0df9b54dfd35d9aaba2c16eb2ef9f4b4b6a5f545/external/iotivity/iotivity_1.2-rel/resource/csdk/connectivity/src/bt_le_adapter/caleadapter.c).
+
+The BLE payload is the same reliable-transport CoAP message described above.
+For example, a caller that already owns GATT connection policy can wrap a
+plaintext discovery request and strictly reassemble response characteristic
+values:
+
+```python
+from smartthings_local.protocol.ble_ocf import (
+    AdaptiveBleOcfReassembler,
+    fragment_pdu,
+)
+from smartthings_local.protocol.coap_tcp import build_coap_tcp_get
+
+request_pdu = build_coap_tcp_get("/oic/res", token=b"\x01")
+request_frames = fragment_pdu(
+    request_pdu,
+    mtu=20,
+    source_port=1,
+    destination_port=0,
+    secure=False,
+)
+
+decoder = AdaptiveBleOcfReassembler(max_pdu_size=64 * 1024)
+response = decoder.feed(received_characteristic_value)
+if response is not None:
+    response_pdu = response.pdu
+```
+
+Here `mtu` means IoTivity's maximum complete characteristic-value frame size,
+not the raw ATT MTU. The default ATT MTU of 23 normally leaves 20 bytes for a
+characteristic value. The adaptive reassembler infers a peer's usable frame
+size from each first frame, rejects inconsistent continuation metadata and
+lengths, and discards partial state after an error.
+
+The two-byte IoTivity header has no fragment sequence number. A duplicated or
+reordered full-size continuation with otherwise identical metadata is
+therefore indistinguishable at this layer; IoTivity relies on GATT's ordered
+delivery. The codec does reject duplicate starts, orphan continuations,
+detectable missing or shortened fragments, and changed port or secure flags.
+
+The secure bit is transport metadata; this codec does not encrypt or
+authenticate the PDU. It also does not connect to Bluetooth, select GATT
+characteristics, discover credentials, or perform setup or ownership work.
+
 Reads retransmit each Block2 request; writes send once. Where a lost write
 has been shown to be the cause rather than a device that is simply refusing
 load, `write_max_attempts` lets `post()` retransmit inside the caller's own
