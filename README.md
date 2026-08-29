@@ -161,6 +161,37 @@ terminal wakeup but closes the established socket immediately, without waiting
 for close-notify. All three methods are idempotent; a quiesced or aborted
 session cannot be connected again.
 
+## CoAP over TCP framing
+
+`smartthings_local.protocol.coap_tcp` provides the pure reliable-transport
+wire codec used by Samsung's IoTivity stack. It follows the variable-length
+header defined by [RFC 8323](https://www.rfc-editor.org/rfc/rfc8323.html) and
+corroborated by Samsung's public IoTivity 1.2 sources for
+[`CAGeneratePDUImpl`](https://github.com/Samsung/TizenRT/blob/0df9b54dfd35d9aaba2c16eb2ef9f4b4b6a5f545/external/iotivity/iotivity_1.2-rel/resource/csdk/connectivity/src/caprotocolmessage.c)
+and
+[`coap_get_total_message_length`](https://github.com/Samsung/TizenRT/blob/0df9b54dfd35d9aaba2c16eb2ef9f4b4b6a5f545/external/iotivity/iotivity_1.2-rel/resource/csdk/connectivity/lib/libcoap-4.1.1/pdu.c).
+
+Builders cover the opening CSM, raw messages, and GET, POST, and DELETE
+convenience forms. The CSM builder can advertise Max-Message-Size and
+Block-Wise-Transfer without owning connection policy.
+`CoapTcpStreamDecoder` accepts partial or concatenated byte-stream chunks,
+emits only complete parsed messages, and rejects an oversized declaration as
+soon as its length prefix is available:
+
+```python
+from smartthings_local.protocol.coap_tcp import (
+    CoapTcpStreamDecoder,
+    build_coap_tcp_get,
+)
+
+request = build_coap_tcp_get("/oic/res", token=b"\x01")
+decoder = CoapTcpStreamDecoder(max_message_size=64 * 1024)
+messages = decoder.feed(received_chunk)
+```
+
+The module deliberately does not open a TCP/TLS/Bluetooth connection, choose a
+carrier, or perform setup and ownership operations. Those remain caller policy.
+
 Reads retransmit each Block2 request; writes send once. Where a lost write
 has been shown to be the cause rather than a device that is simply refusing
 load, `write_max_attempts` lets `post()` retransmit inside the caller's own
