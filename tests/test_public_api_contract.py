@@ -192,6 +192,7 @@ def test_dtls_session_keeps_current_consumer_methods():
         "refresh_observes",
         "start_reader",
         "subscribe",
+        "unsubscribe",
     }
     assert expected <= set(dir(DtlsCoapSession))
     _assert_compatible_signature(DtlsCoapSession.connect, ["self"])
@@ -225,6 +226,15 @@ def test_dtls_session_keeps_current_consumer_methods():
     ]
     assert subscribe_query.kind is inspect.Parameter.KEYWORD_ONLY
     assert subscribe_query.default == ()
+    _assert_compatible_signature(
+        DtlsCoapSession.unsubscribe,
+        ["self", "path_segs"],
+    )
+    refresh_queries = inspect.signature(
+        DtlsCoapSession.refresh_observes
+    ).parameters["queries_by_href"]
+    assert refresh_queries.kind is inspect.Parameter.KEYWORD_ONLY
+    assert refresh_queries.default is None
     get_extra_options = inspect.signature(DtlsCoapSession.get).parameters[
         "extra_options"
     ]

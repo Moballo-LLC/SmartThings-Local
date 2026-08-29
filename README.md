@@ -85,6 +85,25 @@ Message ID. Optional `on_observe_pending`, `on_legacy_notification`, and
 `on_observe_error` constructor callbacks let consumers keep that compatibility
 path distinct from confirmed RFC notifications and ordinary polling.
 
+Periodic renewal can target only the relations that need it; unrelated
+observations remain active. Existing query variants are preserved unless the
+caller supplies an explicit replacement:
+
+```python
+successful, failures = sess.refresh_observes(
+    (("mode", "vs", "0"),),
+    queries_by_href={"/mode/vs/0": ("if=oic.if.b",)},
+)
+removed = sess.unsubscribe(("mode", "vs", "0"))
+```
+
+`successful` reports hrefs whose replacement registration datagram was sent;
+confirmation still comes from the Observe callbacks. `unsubscribe()` retires
+every query-qualified relation for that exact path without disturbing sibling
+paths. Refresh, unsubscribe, and orderly close pace every deregistration just
+as `subscribe()` paces each registration, avoiding request bursts during
+relation maintenance.
+
 POST bodies through 1024 bytes retain the single-request behavior. Larger
 bodies use token-stable Block1 requests under one monotonic timeout, include
 Size1 on the first request, honor a server-requested smaller block size, and
