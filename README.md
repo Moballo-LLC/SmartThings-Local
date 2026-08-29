@@ -81,9 +81,11 @@ An RFC 7641 relation is confirmed only by a valid Observe response option;
 duplicate and stale 24-bit sequence values are not delivered. Some older
 Samsung firmware omits that option. For those devices, a plain initial `2.05`
 is probationary until a later packet arrives on the same token with a different
-Message ID. Optional `on_observe_pending`, `on_legacy_notification`, and
-`on_observe_error` constructor callbacks let consumers keep that compatibility
-path distinct from confirmed RFC notifications and ordinary polling.
+Message ID. Its complete representation is still delivered through
+`on_notification`; a blockwise representation is re-read before delivery.
+Optional `on_observe_pending`, `on_legacy_notification`, and `on_observe_error`
+constructor callbacks let consumers keep that compatibility path distinct from
+confirmed RFC notifications and ordinary polling.
 
 Periodic renewal can target only the relations that need it; unrelated
 observations remain active. Existing query variants are preserved unless the
@@ -143,9 +145,10 @@ Interrupted attempts raise `SessionClosedError`.
 Hosts that stop network work before their blocking executor drains can use the
 session's two-phase shutdown. `quiesce_for_close()` is terminal: it interrupts
 an in-progress handshake, wakes pending requests and notification refetches,
-and rejects new work while retaining an established DTLS socket. A subsequent
-`close()` flushes the authenticated close-notify record before closing that
-socket:
+and rejects new work while retaining an established DTLS socket and active
+Observe relation metadata. A subsequent `close()` paces explicit Observe
+deregistrations, flushes the authenticated close-notify record, and then closes
+that socket:
 
 ```python
 sess.quiesce_for_close()  # safe from the host's early shutdown phase

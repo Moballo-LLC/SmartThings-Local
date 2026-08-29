@@ -9,6 +9,8 @@ import pytest
 from OpenSSL import SSL
 
 from smartthings_local.errors import SessionClosedError
+from smartthings_local.protocol import dtls_session
+from smartthings_local.protocol.coap import OBSERVE, URI_PATH, URI_QUERY, parse_coap
 from smartthings_local.protocol.dtls_session import DtlsCoapSession
 
 
@@ -21,6 +23,11 @@ class _CloseNotifyConnection:
     def __init__(self):
         self.shutdown_calls = 0
         self._outbound = []
+        self.sent = []
+
+    def send(self, datagram):
+        self.sent.append(datagram)
+        return len(datagram)
 
     def shutdown(self):
         self.shutdown_calls += 1
@@ -45,6 +52,9 @@ class _Socket:
             raise OSError("closed")
         self.sent.append(datagram)
         return len(datagram)
+
+    def settimeout(self, _timeout):
+        return None
 
     def close(self):
         self.closed = True
@@ -180,18 +190,31 @@ def test_quiesce_wakes_idle_refetch_worker():
     session.close()
 
 
-def test_close_after_quiesce_flushes_close_notify_without_deregistering():
+def test_close_after_quiesce_deregisters_then_flushes_close_notify():
     session = _session()
     connection = session.conn
     sock = session.sock
     session._observe_tokens = {b"o": "/mode/vs/0"}
-    session._send_observe_dereg = lambda *_args: pytest.fail(
-        "quiesced close sent an application request"
-    )
+    session._observe_queries = {b"o": ("if=oic.if.a",)}
+    session._pace_orderly_close = lambda: None
 
     session.quiesce_for_close()
     session.close()
 
+    assert len(connection.sent) == 1
+    _mtype, _code, _mid, token, options, _payload = parse_coap(
+        connection.sent[0]
+    )
+    assert token == b"o"
+    assert [value for number, value in options if number == URI_PATH] == [
+        b"mode",
+        b"vs",
+        b"0",
+    ]
+    assert [value for number, value in options if number == URI_QUERY] == [
+        b"if=oic.if.a"
+    ]
+    assert (OBSERVE, b"\x01") in options
     assert connection.shutdown_calls == 1
     assert sock.sent == [
         b"\x15\xfe\xfd\x00\x00" + b"\x00" * 6
@@ -206,6 +229,19 @@ def test_close_after_quiesce_flushes_close_notify_without_deregistering():
 
     session.close()
     assert connection.shutdown_calls == 1
+
+
+def test_orderly_close_pacing_waits_after_quiesce(monkeypatch):
+    session = _session(rate_limit_rps=4)
+    session._last_send_ts = 10.0
+    sleeps = []
+    monkeypatch.setattr(dtls_session.time, "monotonic", lambda: 10.1)
+    monkeypatch.setattr(dtls_session.time, "sleep", sleeps.append)
+
+    session.quiesce_for_close()
+    session._pace_orderly_close()
+
+    assert sleeps == pytest.approx([0.15])
 
 
 def test_abort_closes_without_close_notify_and_is_idempotent():
@@ -254,3 +290,15 @@ def test_normal_close_still_deregisters_before_quiescing(monkeypatch):
     session.close()
 
     assert calls == [(b"o", ["mode", "vs", "0"], ())]
+
+
+def test_reader_exit_preserves_relations_for_quiesced_close():
+    session = _session()
+    session._observe_tokens = {b"o": "/mode/vs/0"}
+    session._observe_queries = {b"o": ("if=oic.if.a",)}
+
+    session.quiesce_for_close()
+    session._reader_loop()
+
+    assert session._observe_tokens == {b"o": "/mode/vs/0"}
+    assert session._observe_queries == {b"o": ("if=oic.if.a",)}
