@@ -404,7 +404,7 @@ def test_refresh_observes_paces_the_dereg_sweep():
     calls = []
     sess.pace = lambda: calls.append("pace")
     sess._send_observe_dereg = lambda *_a: calls.append("dereg")
-    sess.subscribe = lambda *_a: calls.append("subscribe")
+    sess.subscribe = lambda *_a, **_k: calls.append("subscribe")
 
     sess.refresh_observes([("power", "vs", "0"), ("oven", "vs", "0")])
 

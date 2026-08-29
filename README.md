@@ -37,14 +37,14 @@ auth = CertificateAuth.from_files(
 sess = DtlsCoapSession(
     "192.0.2.100", 49154,
     auth=auth,
+    on_notification=lambda href, payload: ...,
 )
 sess.connect()
 sess.start_reader()
 
 code, body = sess.get(["device", "0"])                       # Block2-aware read
 code, _    = sess.post(["mode", "vs", "0"], cbor2.dumps({}))  # write
-sess.subscribe(["operational", "state", "vs", "0"],          # OBSERVE
-               on_notification=lambda href, payload: ...)
+sess.subscribe(["operational", "state", "vs", "0"])          # OBSERVE
 sess.close()
 ```
 
@@ -68,6 +68,22 @@ repeatable.
 
 `delete()` uses the same path, query, extension-option, timeout, and response
 contract without sending a request payload.
+
+Observe relations may also include repeated URI-query strings. The same query
+is retained for a blockwise notification refetch and for best-effort
+deregistration:
+
+```python
+sess.subscribe(["mode", "vs", "0"], query=("if=oic.if.b",))
+```
+
+An RFC 7641 relation is confirmed only by a valid Observe response option;
+duplicate and stale 24-bit sequence values are not delivered. Some older
+Samsung firmware omits that option. For those devices, a plain initial `2.05`
+is probationary until a later packet arrives on the same token with a different
+Message ID. Optional `on_observe_pending`, `on_legacy_notification`, and
+`on_observe_error` constructor callbacks let consumers keep that compatibility
+path distinct from confirmed RFC notifications and ordinary polling.
 
 POST bodies through 1024 bytes retain the single-request behavior. Larger
 bodies use token-stable Block1 requests under one monotonic timeout, include
