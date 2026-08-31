@@ -2,13 +2,16 @@
 
 import math
 import socket
+import time
 from dataclasses import dataclass
 
 from ..errors import EndpointError
 
 __all__ = [
+    'HostFilteredUdpSocket',
     'ResolvedUdpEndpoint',
     'open_connected_udp_socket',
+    'open_host_filtered_udp_socket',
     'resolve_udp_endpoint',
     'resolve_udp_endpoints',
 ]
@@ -154,6 +157,150 @@ def open_connected_udp_socket(
             sock.connect(endpoint.sockaddr)
             sock.settimeout(timeout)
             return sock, endpoint
+        except OSError:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    raise EndpointError() from OSError('UDP socket setup failed')
+
+
+def _host_key(family, sockaddr):
+    """Return a comparable host identity, ignoring port and flow label."""
+    try:
+        packed = socket.inet_pton(family, sockaddr[0])
+    except (OSError, UnicodeError, TypeError, ValueError):
+        return None
+    # Retain the IPv6 scope so a link-local reply from another interface is
+    # not mistaken for the target.
+    scope = sockaddr[3] if family == socket.AF_INET6 and len(sockaddr) > 3 else 0
+    return (family, packed, scope)
+
+
+class HostFilteredUdpSocket:
+    """UDP socket that accepts replies from any port on one target host.
+
+    A connected UDP socket accepts datagrams only from the exact port it
+    dialled. RT-OCF binds its DTLS socket to port 0, so an appliance answers
+    from a kernel-assigned port that need not match the port addressed, and a
+    connected socket makes a live appliance look silent. This wrapper keeps
+    sending to the resolved destination and filters inbound datagrams on host
+    alone, which is what ``ocf_discovery`` already does.
+
+    The exposed surface is the subset of the socket API the DTLS callers use.
+    Off-path spoofing resistance drops from address-and-port to address only;
+    the DTLS cookie exchange and handshake authentication remain the real
+    protection, as they already are for a connected socket.
+    """
+
+    __slots__ = (
+        '_dest',
+        '_endpoint',
+        '_host_key',
+        '_sock',
+        '_timeout',
+        'observed_reply_port',
+    )
+
+    def __init__(self, sock, endpoint):
+        self._sock = sock
+        self._endpoint = endpoint
+        self._dest = endpoint.sockaddr
+        self._host_key = _host_key(endpoint.family, endpoint.sockaddr)
+        self._timeout = None
+        #: Source port of the most recent accepted datagram. Diagnostic only;
+        #: replies keep going to the port originally dialled.
+        self.observed_reply_port = None
+
+    @property
+    def endpoint(self):
+        return self._endpoint
+
+    def send(self, data):
+        """Send to the resolved destination, mirroring ``socket.send``."""
+        return self._sock.sendto(data, self._dest)
+
+    def recv(self, bufsize):
+        """Return the next datagram from the target host.
+
+        Datagrams from any other host are discarded without extending the
+        caller's timeout, so a flood from elsewhere cannot hold the call open
+        past its deadline.
+        """
+        timeout = self._timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('timed out')
+                self._sock.settimeout(remaining)
+            datagram, address = self._sock.recvfrom(bufsize)
+            if self._host_key is None or \
+                    _host_key(self._endpoint.family, address) == self._host_key:
+                if len(address) > 1:
+                    self.observed_reply_port = address[1]
+                return datagram
+
+    def settimeout(self, timeout):
+        self._timeout = timeout
+        self._sock.settimeout(timeout)
+
+    def gettimeout(self):
+        return self._timeout
+
+    def fileno(self):
+        return self._sock.fileno()
+
+    def getsockname(self):
+        return self._sock.getsockname()
+
+    def close(self):
+        self._sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+    def __repr__(self):
+        return f'HostFilteredUdpSocket(family={self._endpoint.family_name})'
+
+
+def open_host_filtered_udp_socket(
+        host, port, *, family=socket.AF_UNSPEC, local_port=None, timeout=None):
+    """Open an unconnected UDP socket bound to one target host.
+
+    Mirrors :func:`open_connected_udp_socket`, but the returned socket accepts
+    a reply from any port on the target rather than only the port dialled. See
+    :class:`HostFilteredUdpSocket` for why an OCF appliance needs that.
+    """
+    if local_port is not None:
+        _validate_port(local_port, allow_zero=True)
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise TypeError('timeout must be a number or None')
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError('timeout must be a non-negative number or None')
+
+    endpoints = resolve_udp_endpoints(host, port, family=family)
+    for endpoint in endpoints:
+        sock = None
+        try:
+            sock = socket.socket(
+                endpoint.family, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            if local_port is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Bind unconditionally so the local port is fixed before the first
+            # send, matching the connected path's source-port stability.
+            sock.bind(endpoint.bind_address(local_port or 0))
+            wrapper = HostFilteredUdpSocket(sock, endpoint)
+            wrapper.settimeout(timeout)
+            return wrapper, endpoint
         except OSError:
             if sock is not None:
                 try:

@@ -42,7 +42,7 @@ from ..errors import ProbeError
 from .auth import _DTLS_CIPHERS, _OCF_ROOT_CA, _load_pem_chain
 from .coap import split_dtls
 from .dtls_handshake import _drive_dtls_handshake
-from .endpoint import open_connected_udp_socket
+from .endpoint import open_host_filtered_udp_socket
 
 # DTLS record content types (RFC 6347 §4.1)
 _CT_CHANGE_CIPHER_SPEC = 20
@@ -274,12 +274,12 @@ def _classify_liveness_response(datagram):
 
 def _probe_dtls_port_with_flight(
         host, port, *, flight, timeout, retries, family):
-    """Send one frozen ClientHello flight on a connected UDP socket."""
+    """Send one frozen ClientHello flight on a host-filtered UDP socket."""
     attempt_budget = float(timeout) / (retries + 1)
     attempts = 0
     sock = None
     try:
-        sock, _endpoint = open_connected_udp_socket(
+        sock, _endpoint = open_host_filtered_udp_socket(
             host,
             port,
             family=family,
@@ -302,9 +302,11 @@ def _probe_dtls_port_with_flight(
                     break
                 response_kind, alert = _parse_liveness_response(datagram)
                 if response_kind is None:
-                    # A connected UDP socket already rejects other peers. An
-                    # unrelated or malformed datagram from the appliance must
-                    # not consume a retransmission or count as DTLS proof.
+                    # The socket already rejects other hosts, and an
+                    # appliance may legitimately answer from a port other than
+                    # the one dialled. An unrelated or malformed datagram from
+                    # it must still not consume a retransmission or count as
+                    # DTLS proof.
                     continue
                 return DtlsLivenessResult(
                     port=port,
@@ -591,7 +593,7 @@ def diagnose_dtls_handshake(
     conn.set_ciphertext_mtu(mtu)
 
     try:
-        sock, _endpoint = open_connected_udp_socket(
+        sock, _endpoint = open_host_filtered_udp_socket(
             host,
             port,
             family=family,

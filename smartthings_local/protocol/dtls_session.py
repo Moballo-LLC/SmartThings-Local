@@ -89,7 +89,7 @@ from .dtls_handshake import (
     _drive_dtls_handshake,
     _HandshakeCancelled,
 )
-from .endpoint import open_connected_udp_socket
+from .endpoint import open_host_filtered_udp_socket
 
 # Private compatibility exports used by dtls_probe and existing callers.
 _DTLS_CIPHERS = _auth._DTLS_CIPHERS
@@ -172,7 +172,9 @@ class _MidExchange:
 # usually works. UDP delivery was never guaranteed, so treat them as
 # advisory and keep reading. Unconnected sockets never see any of this,
 # which is why the reader survived them before the connected-socket change
-# in d677c72 (v0.1.3).
+# in d677c72 (v0.1.3). The session moved back to an unconnected socket for
+# issue #66, so this set is now defensive: it costs nothing and still covers
+# any caller that supplies a connected socket adapter of its own.
 _ADVISORY_ERRNOS = frozenset(
     value for value in (
         getattr(errno, name, None)
@@ -592,7 +594,7 @@ class DtlsCoapSession:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise SessionTimeoutError()
-        sock, endpoint = open_connected_udp_socket(
+        sock, endpoint = open_host_filtered_udp_socket(
             self.host,
             self.port,
             family=self.family,
@@ -1760,9 +1762,8 @@ class DtlsCoapSession:
                         except EndpointError:
                             # Attempt 0 is the caller's only datagram, so its
                             # failure is theirs to see. A retransmit is
-                            # best-effort: a connected UDP socket reports the
-                            # ICMP error queued by an earlier send on the next
-                            # one, and the reader treats those same errnos as
+                            # best-effort: a send can still fail locally,
+                            # and the reader treats the same errnos as
                             # advisory. Failing the exchange on one would make
                             # retransmitting less robust than not bothering,
                             # while the original datagram may still be

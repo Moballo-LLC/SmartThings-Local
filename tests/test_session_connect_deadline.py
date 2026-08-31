@@ -137,7 +137,7 @@ def _install_handshake(
     )
     monkeypatch.setattr(
         dtls_session,
-        "open_connected_udp_socket",
+        "open_host_filtered_udp_socket",
         open_socket,
     )
     monkeypatch.setattr(dtls_session.time, "monotonic", clock.monotonic)
@@ -241,7 +241,7 @@ def test_context_setup_consumes_the_same_deadline(monkeypatch):
 
     monkeypatch.setattr(dtls_session.SSL, "Context", lambda *_args: object())
     monkeypatch.setattr(dtls_session.SSL, "Connection", lambda *_args: _Connection())
-    monkeypatch.setattr(dtls_session, "open_connected_udp_socket", open_socket)
+    monkeypatch.setattr(dtls_session, "open_host_filtered_udp_socket", open_socket)
     monkeypatch.setattr(dtls_session.time, "monotonic", clock.monotonic)
     session = _session(_Auth(clock, configure_delay=0.2))
 
@@ -274,7 +274,7 @@ def test_socket_setup_consumes_the_same_deadline(monkeypatch):
         "Connection",
         lambda *_args: connection,
     )
-    monkeypatch.setattr(dtls_session, "open_connected_udp_socket", open_socket)
+    monkeypatch.setattr(dtls_session, "open_host_filtered_udp_socket", open_socket)
     monkeypatch.setattr(dtls_session.time, "monotonic", clock.monotonic)
 
     with pytest.raises(SessionTimeoutError):

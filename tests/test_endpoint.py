@@ -7,8 +7,10 @@ from OpenSSL import SSL
 from smartthings_local.errors import EndpointError
 from smartthings_local.protocol import dtls_session
 from smartthings_local.protocol.endpoint import (
+    HostFilteredUdpSocket,
     ResolvedUdpEndpoint,
     open_connected_udp_socket,
+    open_host_filtered_udp_socket,
     resolve_udp_endpoint,
     resolve_udp_endpoints,
 )
@@ -290,7 +292,7 @@ def test_socket_timeout_must_be_finite_and_non_negative(timeout):
         open_connected_udp_socket('device.example', 5684, timeout=timeout)
 
 
-def test_session_uses_connected_socket_send_and_recv(monkeypatch):
+def test_session_uses_host_filtered_socket_send_and_recv(monkeypatch):
     endpoint = ResolvedUdpEndpoint(
         socket.AF_INET6, ('2001:db8::10', 5684, 0, 0))
     sock = FakeSocket(socket.AF_INET6)
@@ -356,7 +358,7 @@ def test_session_uses_connected_socket_send_and_recv(monkeypatch):
         dtls_session.SSL, 'Connection', lambda *args: connection)
     monkeypatch.setattr(
         dtls_session,
-        'open_connected_udp_socket',
+        'open_host_filtered_udp_socket',
         open_socket,
     )
     monkeypatch.setattr(dtls_session.time, 'sleep', lambda _delay: None)
@@ -421,3 +423,164 @@ def test_session_send_failure_has_no_raw_exception_context():
     assert 'UDP send failed' in formatted
     assert 'credential-value' not in formatted
     assert 'device.example' not in formatted
+
+
+# --- issue #66: an appliance answering from a port it was not dialled on ----
+#
+# RT-OCF binds its DTLS socket to port 0 (rt_udp.c rt_udp_open_server), so the
+# secure port is kernel-assigned and a reply legitimately arrives from a source
+# port other than the one addressed. A connected UDP socket drops those, which
+# made a live appliance report as dead.
+
+
+class _RecordingUdpSocket:
+    """Underlying socket stub that replays a scripted inbound sequence."""
+
+    def __init__(self, family, inbound=()):
+        self.family = family
+        self.inbound = list(inbound)
+        self.sent = []
+        self.timeouts = []
+        self.bound = None
+        self.closed = False
+        self.options = []
+
+    def setsockopt(self, *args):
+        self.options.append(args)
+
+    def bind(self, address):
+        self.bound = address
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def sendto(self, data, address):
+        self.sent.append((data, address))
+        return len(data)
+
+    def recvfrom(self, _size):
+        if not self.inbound:
+            raise TimeoutError('timed out')
+        return self.inbound.pop(0)
+
+    def getsockname(self):
+        return self.bound
+
+    def fileno(self):
+        return 7
+
+    def close(self):
+        self.closed = True
+
+
+def _v4_endpoint(port=5684):
+    return ResolvedUdpEndpoint(socket.AF_INET, ('192.0.2.10', port))
+
+
+def test_reply_from_another_source_port_is_accepted():
+    endpoint = _v4_endpoint()
+    inner = _RecordingUdpSocket(
+        socket.AF_INET,
+        inbound=[(b'\x16reply', ('192.0.2.10', 59768))],
+    )
+    sock = HostFilteredUdpSocket(inner, endpoint)
+
+    assert sock.recv(4096) == b'\x16reply'
+    # The port the appliance answered from is recorded for diagnostics only.
+    assert sock.observed_reply_port == 59768
+
+
+def test_send_still_targets_the_dialled_port():
+    endpoint = _v4_endpoint()
+    inner = _RecordingUdpSocket(
+        socket.AF_INET,
+        inbound=[(b'\x16reply', ('192.0.2.10', 59768))],
+    )
+    sock = HostFilteredUdpSocket(inner, endpoint)
+    sock.recv(4096)
+    sock.send(b'\x16request')
+
+    # Following the reply port would be an unevidenced behaviour change; #66's
+    # capture shows the appliance still accepting on the port originally used.
+    assert inner.sent == [(b'\x16request', ('192.0.2.10', 5684))]
+
+
+def test_datagram_from_another_host_is_discarded():
+    endpoint = _v4_endpoint()
+    inner = _RecordingUdpSocket(
+        socket.AF_INET,
+        inbound=[
+            (b'\x16spoof', ('198.51.100.7', 5684)),
+            (b'\x16real', ('192.0.2.10', 41234)),
+        ],
+    )
+    sock = HostFilteredUdpSocket(inner, endpoint)
+
+    assert sock.recv(4096) == b'\x16real'
+    assert sock.observed_reply_port == 41234
+
+
+def test_foreign_datagrams_do_not_extend_the_deadline(monkeypatch):
+    endpoint = _v4_endpoint()
+    inner = _RecordingUdpSocket(
+        socket.AF_INET,
+        inbound=[(b'\x16spoof', ('198.51.100.7', 5684))] * 50,
+    )
+    sock = HostFilteredUdpSocket(inner, endpoint)
+    sock.settimeout(1.0)
+
+    clock = iter([0.0] + [0.3, 0.6, 0.9, 1.2] + [9.0] * 50)
+    monkeypatch.setattr(
+        'smartthings_local.protocol.endpoint.time.monotonic',
+        lambda: next(clock))
+
+    with pytest.raises(TimeoutError):
+        sock.recv(4096)
+
+    # Each discarded datagram shortens the remaining budget rather than
+    # restarting it, so a flood cannot hold recv open past its deadline.
+    assert inner.timeouts[-1] < 1.0
+    assert inner.inbound, 'recv consumed the whole flood instead of timing out'
+
+
+def test_ipv6_scope_is_part_of_host_identity():
+    endpoint = ResolvedUdpEndpoint(
+        socket.AF_INET6, ('2001:db8::10', 5684, 0, 2))
+    inner = _RecordingUdpSocket(
+        socket.AF_INET6,
+        inbound=[
+            (b'\x16wrong-if', ('2001:db8::10', 5684, 0, 3)),
+            (b'\x16right-if', ('2001:db8::10', 59768, 0, 2)),
+        ],
+    )
+    sock = HostFilteredUdpSocket(inner, endpoint)
+
+    # The same address arriving with a different scope is a different peer,
+    # which is what keeps a link-local reply from another interface out.
+    assert sock.recv(4096) == b'\x16right-if'
+
+
+def test_open_host_filtered_udp_socket_binds_without_connecting(monkeypatch):
+    created = []
+
+    def factory(family, _socktype, _protocol):
+        sock = _RecordingUdpSocket(family)
+        created.append(sock)
+        return sock
+
+    monkeypatch.setattr(
+        'smartthings_local.protocol.endpoint.socket.socket', factory)
+    monkeypatch.setattr(
+        'smartthings_local.protocol.endpoint.socket.getaddrinfo',
+        lambda *_a, **_k: [_addrinfo(socket.AF_INET, ('192.0.2.10', 5684))])
+
+    sock, endpoint = open_host_filtered_udp_socket(
+        '192.0.2.10', 5684, timeout=2.0)
+
+    assert isinstance(sock, HostFilteredUdpSocket)
+    assert endpoint.port == 5684
+    assert created[0].bound == ('', 0)
+    assert not hasattr(created[0], 'peer')
+    assert sock.gettimeout() == 2.0
+    sock.close()
+    assert created[0].closed

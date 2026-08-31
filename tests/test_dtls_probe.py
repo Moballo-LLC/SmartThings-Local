@@ -251,7 +251,7 @@ def test_stateless_probe_forwards_explicit_address_family(monkeypatch):
         fake.settimeout(timeout)
         return fake, object()
 
-    monkeypatch.setattr(p, 'open_connected_udp_socket', open_socket)
+    monkeypatch.setattr(p, 'open_host_filtered_udp_socket', open_socket)
 
     result = p.probe_dtls_port(
         'appliance.invalid', 5684, family=socket.AF_INET6, timeout=0.2)
@@ -426,7 +426,7 @@ def test_diagnostic_honors_timeout_below_half_second(monkeypatch):
         sock.settimeout(timeout)
         return sock, object()
 
-    monkeypatch.setattr(p, 'open_connected_udp_socket', open_socket)
+    monkeypatch.setattr(p, 'open_host_filtered_udp_socket', open_socket)
     monkeypatch.setattr(p.time, 'monotonic', lambda: now[0])
 
     result = p.diagnose_dtls_handshake(
