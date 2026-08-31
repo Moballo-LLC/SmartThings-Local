@@ -545,17 +545,18 @@ def test_foreign_datagrams_do_not_extend_the_deadline(monkeypatch):
 
 def test_ipv6_scope_is_part_of_host_identity():
     endpoint = ResolvedUdpEndpoint(
-        socket.AF_INET6, ('fe80::10', 5684, 0, 2))
+        socket.AF_INET6, ('2001:db8::10', 5684, 0, 2))
     inner = _RecordingUdpSocket(
         socket.AF_INET6,
         inbound=[
-            (b'\x16wrong-if', ('fe80::10', 5684, 0, 3)),
-            (b'\x16right-if', ('fe80::10', 59768, 0, 2)),
+            (b'\x16wrong-if', ('2001:db8::10', 5684, 0, 3)),
+            (b'\x16right-if', ('2001:db8::10', 59768, 0, 2)),
         ],
     )
     sock = HostFilteredUdpSocket(inner, endpoint)
 
-    # The same link-local address on a different interface is a different peer.
+    # The same address arriving with a different scope is a different peer,
+    # which is what keeps a link-local reply from another interface out.
     assert sock.recv(4096) == b'\x16right-if'
 
 
