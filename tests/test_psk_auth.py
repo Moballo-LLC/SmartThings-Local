@@ -363,7 +363,7 @@ def test_psk_handshake_rejection_does_not_expose_credentials():
         patch.object(session_module.SSL, "Connection", return_value=connection),
         patch.object(
             session_module,
-            "open_connected_udp_socket",
+            "open_host_filtered_udp_socket",
             return_value=(udp_socket, endpoint),
         ),
         pytest.raises(SessionError) as captured,

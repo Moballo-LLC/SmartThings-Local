@@ -94,7 +94,7 @@ def _install_connection(monkeypatch, connection, data_socket, *, on_open=None):
     )
     monkeypatch.setattr(
         dtls_session,
-        "open_connected_udp_socket",
+        "open_host_filtered_udp_socket",
         open_socket,
     )
     return endpoint
@@ -140,7 +140,7 @@ def test_cancel_during_context_setup_stops_before_socket_setup(monkeypatch):
     monkeypatch.setattr(dtls_session.SSL, "Context", lambda *_args: object())
     monkeypatch.setattr(
         dtls_session,
-        "open_connected_udp_socket",
+        "open_host_filtered_udp_socket",
         lambda *_args, **_kwargs: pytest.fail(
             "cancelled connect opened a socket"
         ),

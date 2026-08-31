@@ -129,7 +129,7 @@ def test_handshake_error_is_classified_without_backend_text(monkeypatch):
         dtls_session.socket.AF_INET, ('192.0.2.10', 5684))
     monkeypatch.setattr(
         dtls_session,
-        'open_connected_udp_socket',
+        'open_host_filtered_udp_socket',
         lambda *args, **kwargs: (fake_socket, endpoint),
     )
 
