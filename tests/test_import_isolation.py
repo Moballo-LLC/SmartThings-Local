@@ -16,6 +16,7 @@ def test_smartthings_local_imports_without_mqtt_demo_present(tmp_path):
     shutil.copytree(REPO_ROOT / "smartthings_local", tmp_path / "smartthings_local")
 
     import_lines = [
+        "import smartthings_local.protocol.ble_ocf",
         "import smartthings_local.protocol.coap",
         "import smartthings_local.protocol.coap_tcp",
         "import smartthings_local.protocol.ocf_multicast",
